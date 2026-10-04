@@ -23,15 +23,23 @@ QUEUE = os.path.join(DATA, "queue")
 COMPOSE = ["docker", "compose", "-f", os.path.join(HERE, "docker-compose.yml")]
 
 
+def die(msg):
+    print(f"lk: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
 def send(job, timeout=90):
     os.makedirs(QUEUE, exist_ok=True)
     jid = uuid.uuid4().hex[:12]
     jin = os.path.join(QUEUE, f"job-{jid}.in")
     jout = os.path.join(QUEUE, f"job-{jid}.out")
-    with open(jin, "w") as f:
-        json.dump(job, f)
-    # 0666 so the image (root in container) can delete it on bind mounts
-    os.chmod(jin, 0o666)
+    try:
+        with open(jin, "w") as f:
+            json.dump(job, f)
+        # 0666 so the image (root in container) can delete it on bind mounts
+        os.chmod(jin, 0o666)
+    except OSError as e:
+        die(f"cannot write to the job queue {QUEUE}: {e.strerror}")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(jout):
@@ -45,9 +53,12 @@ def send(job, timeout=90):
             return out
         time.sleep(0.08)
     if os.path.exists(jin):
-        print(f"TIMEOUT: job {jid} not picked up; live image down?", file=sys.stderr)
-        return None
-    return None
+        try:
+            os.unlink(jin)  # don't leave the live image a job nobody awaits
+        except OSError:
+            pass
+    die(f"no answer from the live image within {timeout:g}s; "
+        "is it up? `docker compose ps` / `lk logs`")
 
 
 def maybe_json(s):
@@ -66,13 +77,20 @@ def compose(*args, capture=False):
     return subprocess.run(COMPOSE + list(args), capture_output=capture, text=True)
 
 
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError as e:
+        die(f"cannot read {path}: {e.strerror}")
+
+
 def cmd_eval(a):
     print(send({"type": "eval", "code": a.code}, timeout=a.timeout))
 
 
 def cmd_file(a):
-    with open(a.path) as f:
-        print(send({"type": "eval", "code": f.read()}, timeout=a.timeout))
+    print(send({"type": "eval", "code": read_file(a.path)}, timeout=a.timeout))
 
 
 def cmd_simple(name):
@@ -104,13 +122,13 @@ def cmd_rollback(a):
 
 
 def cmd_candidate(a):
-    code = open(a.path).read()
-    repro = open(a.repro).read() if a.repro else None
+    code = read_file(a.path)
+    repro = read_file(a.repro) if a.repro else None
     pp(send({"type": "test_candidate", "code": code, "repro": repro}, timeout=180))
 
 
 def cmd_heal(a):
-    repro = open(a.repro).read() if a.repro else ""
+    repro = read_file(a.repro) if a.repro else ""
     pp(send({"type": "heal", "problem": a.problem, "repro": repro,
              "target": a.target or ""}, timeout=a.timeout))
 

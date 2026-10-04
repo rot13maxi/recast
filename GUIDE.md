@@ -26,7 +26,8 @@ sleep 12                            # VM boots: base image + journal replay + RE
 and the CLI measures the file mtime:
 
 ```json
-{ "alive": true, "journalSize": 0, "marker": 0, "heartbeatAgeSec": 1.3 }
+{ "alive": true, "journalSize": 0, "marker": 0, "heartbeatAgeSec": 0.0,
+  "agentMode": "live", "testClasses": ["VendingMachineTests"], "...": "..." }
 ```
 
 The app inside is one demo class, `VendingMachine`: insert coins until you
@@ -83,14 +84,16 @@ now `dispense` always raises:
   self error: ''the machine is on fire'''. nil"
 
 ./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
-# -> EXCEPTION: the machine is on fire
+# -> ERROR: Error: the machine is on fire
+#    (raised errors come back "ERROR: <ErrorClass>: <description>", NOT
+#     "EXCEPTION:" — evalQuiet returns that shape; don't grep for EXCEPTION)
 ```
 
 The gate notices:
 
 ```bash
 ./lk tests        # "ok": false — testDispenseAfterCredit fails
-./lk promote      # refuses: "ok": false, "why": tests failing
+./lk promote      # refuses: "ok": false, "why": "refusing to promote: tests failing"
 ```
 
 **Production can't bake a regression** — promote is gated on the suite, and
@@ -142,7 +145,9 @@ Audit trail:
 
 ```bash
 ./lk tests        # green again
-./lk healed       # heal history: id, problem, swapped source, verdicts
+./lk healed       # SUCCESSFUL heals only: id, target, source, swapResult
+                  # (rejection like the BOGUS one is NOT recorded here — it lives
+                  #  only in data/heal/req-1.json; ls that dir for the full record)
 ls data/heal/     # req-N.json / resp-N.json — the raw proposals
 ```
 
@@ -173,7 +178,7 @@ Try the tentative window yourself:
 ```bash
 ./lk eval "Greeting compile: 'greet: name
   ^ ''bonjour, '', name'. nil"
-./lk eval "Greeting new greet: 'maintenant'"   # -> 'bonjour, maintenant!'
+./lk eval "Greeting new greet: 'maintenant'"   # -> 'bonjour, maintenant'
 docker compose restart prod                     # tentative edit dies here
 sleep 12
 ./lk eval "Greeting new greet: 'again'"         # -> 'hello, again!'
@@ -185,7 +190,17 @@ The promoted `greet:` survives; the tentative one evaporates with the VM.
 
 ```bash
 ./lk logs                        # prod VM logs
-./lk candidate fix.st --repro r.st   # shadow-validate a patch WITHOUT touching live
+# shadow-validate a patch WITHOUT touching the live image:
+cat > /tmp/fix.st <<'EOF'
+VendingMachine compile: 'dispense
+	paid >= price ifFalse: [ self error: ''insufficient credit'' ].
+	paid := paid - price.
+	^ ''product'''
+EOF
+cat > /tmp/r.st <<'EOF'
+| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
+EOF
+./lk candidate /tmp/fix.st --repro /tmp/r.st   # "ok": true; live image untouched
 ./lk rollback 0 && docker compose restart prod   # full rewind
 ./lk reset --yes                 # wipe /data, reboot pristine
 ```
@@ -194,7 +209,9 @@ The promoted `greet:` survives; the tentative one evaporates with the VM.
 
 ```bash
 docker compose down              # stop both containers
-kill %1 2>/dev/null || pkill -f fakellm.py     # stop the fake LLM
+pkill -f fakellm.py                            # stop the fake LLM (job-control
+                                                #  %1 only works in the shell that
+                                                #  started it — pkill is the safe net)
 rm -rf data                      # clear journal/heal state (or keep it)
 ```
 

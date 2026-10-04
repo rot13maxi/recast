@@ -13,6 +13,9 @@ bakes when it's green.**
 
 This repo is a working proof of that loop, on real Pharo 12.
 
+**New here? Start with [`GUIDE.md`](GUIDE.md)** — a copy-pasteable lifecycle
+tour: boot, hot-swap, break prod, self-heal, ship a feature, tear down.
+
 ## The loop
 
 ```
@@ -221,6 +224,7 @@ non-self-authored.
 ## Layout
 
 ```
+GUIDE.md                lifecycle walkthrough (start here)
 kernel/gen_methods.py   generates methods.json + install/boot .st (edit this)
 kernel/methods.json     the kernel's Smalltalk sources (generated)
 kernel/boot_eval.st     the single eval that boots the container

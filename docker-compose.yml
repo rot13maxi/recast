@@ -1,0 +1,33 @@
+services:
+  # The live production image: one persistent Pharo VM running the queue REPL.
+  # "prod" == /data/journal[1..marker]; hot-swaps beyond marker are tentative.
+  prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: live-smalltalk:latest
+    container_name: live-smalltalk-prod
+    volumes:
+      - ./data:/data
+    environment:
+      LIVE_DATA: /data
+    restart: unless-stopped
+
+  # LLM side of self-healing. Trusted to propose, never to apply:
+  # the image shadow-verifies every patch before swapping it.
+  supervisor:
+    build:
+      context: .
+      dockerfile: Dockerfile.supervisor
+    image: live-smalltalk-supervisor:latest
+    container_name: live-smalltalk-supervisor
+    volumes:
+      - ./data/heal:/data/heal
+    environment:
+      HEAL_DIR: /data/heal
+      LIVE_LLM_URL: ${LIVE_LLM_URL:-http://host.docker.internal:8899/v1/chat/completions}
+      LIVE_LLM_MODEL: ${LIVE_LLM_MODEL:-gpt-4o-mini}
+      LIVE_LLM_API_KEY: ${LIVE_LLM_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped

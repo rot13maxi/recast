@@ -1,0 +1,298 @@
+{
+ "classes": [
+  {
+   "name": "LiveKernel",
+   "ivars": "",
+   "package": "LiveKernel",
+   "methods": [
+    {
+     "sel": "dataDir",
+     "classSide": true,
+     "source": "dataDir\n^ '/data'"
+    },
+    {
+     "sel": "ensureDir:",
+     "classSide": true,
+     "source": "ensureDir: aPath\nLibC system: 'mkdir -p ', aPath asString, ' >/dev/null'"
+    },
+    {
+     "sel": "pathFor:",
+     "classSide": true,
+     "source": "pathFor: aString\n^ self dataDir, '/', aString"
+    },
+    {
+     "sel": "readJson:default:",
+     "classSide": true,
+     "source": "readJson: fileName default: defaultValue\n| ref |\n\tref := (self pathFor: fileName) asFileReference.\n\tref exists ifFalse: [ ^ defaultValue ].\n\t^ [ STONJSON fromString: ref contents ]\n\t\ton: Error do: [ :e | defaultValue ]"
+    },
+    {
+     "sel": "writeJson:value:",
+     "classSide": true,
+     "source": "writeJson: fileName value: anObject\n| final tmp |\n\tself ensureDir: self dataDir.\n\tfinal := (self pathFor: fileName) asFileReference.\n\ttmp := (self pathFor: fileName, '.tmp') asFileReference.\n\ttmp writeStreamDo: [ :s | s nextPutAll: (STONJSON toString: anObject) ].\n\tfinal exists ifTrue: [ final ensureDelete ].\n\ttmp moveTo: final"
+    },
+    {
+     "sel": "marker",
+     "classSide": true,
+     "source": "marker\n^ (self readJson: 'marker.json'\n\t\tdefault: (Dictionary new at: 'n' put: 0; yourself))\n\t\tat: 'n' ifAbsent: [ 0 ]"
+    },
+    {
+     "sel": "writeMarker:",
+     "classSide": true,
+     "source": "writeMarker: n\nself writeJson: 'marker.json'\n\t\tvalue: (Dictionary new at: 'n' put: n asInteger; yourself)"
+    },
+    {
+     "sel": "journal",
+     "classSide": true,
+     "source": "journal\n^ (self readJson: 'journal.json' default: #()) asArray"
+    },
+    {
+     "sel": "journalAppend:",
+     "classSide": true,
+     "source": "journalAppend: sourceString\n| j |\n\tj := self journal asOrderedCollection.\n\tj add: sourceString asString.\n\tself writeJson: 'journal.json' value: j asArray"
+    },
+    {
+     "sel": "replayUpTo:",
+     "classSide": true,
+     "source": "replayUpTo: n\n| failures j limit |\n\tfailures := OrderedCollection new.\n\tj := self journal.\n\tlimit := n min: j size.\n\t1 to: limit do: [ :i | | r |\n\t\tr := self evalQuiet: (j at: i).\n\t\t((r beginsWith: 'ERROR:') or: [ r beginsWith: 'EXCEPTION:' ])\n\t\t\tifTrue: [ failures add: (i -> r) ] ].\n\t^ failures"
+    },
+    {
+     "sel": "isDefinition:",
+     "classSide": true,
+     "source": "isDefinition: sourceString\n| s |\n\ts := sourceString asString.\n\t^(s includesSubstring: 'subclass:')\n\t\tor: [ (s includesSubstring: 'compile:')\n\t\tor: [ (s includesSubstring: 'removeSelector:')\n\t\tor: [ (s includesSubstring: 'instanceVariableNames:') ] ] ]"
+    },
+    {
+     "sel": "eval:",
+     "classSide": true,
+     "source": "eval: sourceString\n| source before result clean |\n\tsource := sourceString asString.\n\tbefore := Smalltalk globals keys asSet.\n\tresult := self evalQuiet: source.\n\t((source beginsWith: '// nojournal') not\n\t\tand: [ self isDefinition: source ]) ifTrue: [\n\t\tclean := ((result beginsWith: 'ERROR:')\n\t\t\tor: [ (result beginsWith: 'EXCEPTION:')\n\t\t\tor: [ (result beginsWith: 'NOTIFICATION:') ] ]) not.\n\t\tclean ifTrue: [\n\t\t\tself journalAppend: source.\n\t\t\t(Smalltalk globals keys asSet difference: before) do: [ :sym |\n\t\t\t\t(sym asString endsWith: 'Tests')\n\t\t\t\t\tifTrue: [ self addTestClassNamed: sym asString ] ] ] ].\n\t^ result"
+    },
+    {
+     "sel": "evalQuiet:",
+     "classSide": true,
+     "source": "evalQuiet: sourceString\n| result wrapped |\n\twrapped := '[' , sourceString asString , '] value'.\n\tresult := [ Smalltalk compiler evaluate: wrapped ]\n\t\ton: Error do: [ :e | ^ 'ERROR: ', e asString ].\n\t^ result isNil\n\t\tifTrue: [ 'nil' ]\n\t\tifFalse: [ [ result printString ]\n\t\t\ton: Error do: [ :e | 'a ', result class name asString ] ]"
+    },
+    {
+     "sel": "truncate:to:",
+     "classSide": true,
+     "source": "truncate: aString to: n\n| s |\n\ts := aString asString.\n\t^ s size <= n ifTrue: [ s ] ifFalse: [ s copyFrom: 1 to: n ]"
+    },
+    {
+     "sel": "boot",
+     "classSide": true,
+     "source": "boot\n| failures |\n\tfailures := self replayUpTo: self marker.\n\tTranscript show: ('LK-BOOT: replayed ', self marker asString, ' entries, ',\n\t\tfailures size asString, ' failures'); cr; flush.\n\t^ 'boot ok'"
+    },
+    {
+     "sel": "shadowRun:",
+     "classSide": true,
+     "source": "shadowRun: spec\n| n candidatePath reproPath outPath report tests reproResult candResult |\n\tn := spec at: 'n' ifAbsent: [ 0 ].\n\tcandidatePath := spec at: 'candidate'.\n\treproPath := spec at: 'repro' ifAbsent: [ nil ].\n\toutPath := spec at: 'out'.\n\tself replayUpTo: n.\n\tcandResult := self evalQuiet: candidatePath asFileReference contents.\n\treproResult := 'skipped'.\n\treproPath ifNotNil: [ :p |\n\t\t(p asFileReference exists\n\t\t\tand: [ p asFileReference contents ~= 'nil' ])\n\t\t\t\tifTrue: [ reproResult := self evalQuiet: p asFileReference contents ] ].\n\ttests := TestRunner runAll.\n\treport := Dictionary new\n\t\tat: 'tests' put: tests;\n\t\tat: 'repro' put: (self truncate: reproResult to: 500);\n\t\tyourself.\n\treport at: 'candidate' put: (self truncate: candResult to: 300).\n\treport at: 'ok' put: ((tests at: 'ok')\n\t\tand: [ (self reproPassed: reproResult)\n\t\tand: [ (self evalResultFailed: candResult) not ] ]).\n\t(outPath asFileReference) parent ensureCreateDirectory.\n\toutPath asFileReference writeStreamDo: [ :s |\n\t\ts nextPutAll: (STONJSON toString: report) ].\n\t^ report"
+    },
+    {
+     "sel": "evalResultFailed:",
+     "classSide": true,
+     "source": "evalResultFailed: aString\n| r |\n\tr := aString asString.\n\t^ (r beginsWith: 'ERROR:')\n\t\tor: [ (r beginsWith: 'EXCEPTION:')\n\t\tor: [ (r beginsWith: 'NOTIFICATION:') ] ]"
+    },
+    {
+     "sel": "reproPassed:",
+     "classSide": true,
+     "source": "reproPassed: aString\n| r |\n\tr := aString asString.\n\t(r = 'skipped' or: [ r = 'none' or: [ r = 'nil' ] ])\n\t\tifTrue: [ ^ true ].\n\t(r beginsWith: 'EXCEPTION:') ifTrue: [ ^ false ].\n\t(r beginsWith: 'ERROR:') ifTrue: [ ^ false ].\n\t^ (r = 'false') not"
+    },
+    {
+     "sel": "config",
+     "classSide": true,
+     "source": "config\n^ self readJson: 'config.json' default: Dictionary new"
+    },
+    {
+     "sel": "configAt:put:",
+     "classSide": true,
+     "source": "configAt: key put: value\n| c |\n\tc := self config.\n\tc at: key asString put: value.\n\tself writeJson: 'config.json' value: c.\n\t^ c"
+    },
+    {
+     "sel": "configAt:default:",
+     "classSide": true,
+     "source": "configAt: key default: defaultValue\n^ self config at: key asString ifAbsent: [ defaultValue ]"
+    },
+    {
+     "sel": "healed",
+     "classSide": true,
+     "source": "healed\n^ (self readJson: 'healed.json' default: #()) asArray"
+    },
+    {
+     "sel": "noteHealed:",
+     "classSide": true,
+     "source": "noteHealed: entry\n| h |\n\th := self healed asOrderedCollection.\n\th add: entry.\n\tself writeJson: 'healed.json' value: h asArray"
+    },
+    {
+     "sel": "addTestClassNamed:",
+     "classSide": true,
+     "source": "addTestClassNamed: aString\n| names |\n\tnames := self testClassNames asOrderedCollection.\n\t(names includes: aString asString) ifFalse: [\n\t\tnames add: aString asString.\n\t\tself writeJson: 'tests.json' value: names asArray ]"
+    },
+    {
+     "sel": "testClassNames",
+     "classSide": true,
+     "source": "testClassNames\n^ (self readJson: 'tests.json'\n\t\tdefault: #('VendingMachineTests')) asArray"
+    },
+    {
+     "sel": "promote",
+     "classSide": true,
+     "source": "promote\n| tests |\n\ttests := TestRunner runAll.\n\t(tests at: 'ok') ifFalse: [\n\t\t^ (Dictionary new\n\t\t\tat: 'ok' put: false;\n\t\t\tat: 'why' put: 'refusing to promote: tests failing';\n\t\t\tat: 'tests' put: tests;\n\t\t\tyourself) ].\n\tself writeMarker: self journal size.\n\t^ (Dictionary new\n\t\tat: 'ok' put: true;\n\t\tat: 'marker' put: self marker;\n\t\tat: 'journalSize' put: self journal size;\n\t\tat: 'tests' put: tests;\n\t\tyourself)"
+    },
+    {
+     "sel": "rollbackTo:",
+     "classSide": true,
+     "source": "rollbackTo: n\n| safe |\n\tsafe := n asInteger min: self journal size max: 0.\n\tself writeMarker: safe.\n\t^ (Dictionary new at: 'ok' put: true; at: 'marker' put: safe; yourself)"
+    },
+    {
+     "sel": "status",
+     "classSide": true,
+     "source": "status\n| hb age |\n\thb := (self pathFor: 'queue/heartbeat.txt') asFileReference.\n\tage := hb exists\n\t\tifTrue: [ [ (Time millisecondClockValue - hb contents asInteger) abs ]\n\t\t\ton: Error do: [ :e | -2 ] ]\n\t\tifFalse: [ -1 ].\n\t^ (Dictionary new\n\t\tat: 'journalSize' put: self journal size;\n\t\tat: 'marker' put: self marker;\n\t\tat: 'testClasses' put: self testClassNames;\n\t\tat: 'healedCount' put: self healed size;\n\t\tat: 'agentMode' put: (self configAt: 'agentMode' default: 'live');\n\t\tat: 'llmModel' put: (self configAt: 'llmModel' default: '');\n\t\tat: 'heartbeatAgeSec' put: age;\n\t\tat: 'alive' put: (age >= 0 and: [ age < 30 ]);\n\t\tyourself)"
+    }
+   ]
+  },
+  {
+   "name": "TestRunner",
+   "ivars": "",
+   "package": "LiveKernel",
+   "methods": [
+    {
+     "sel": "runAll",
+     "classSide": true,
+     "source": "runAll\n| passed failed descriptions |\n\tpassed := 0. failed := 0. descriptions := OrderedCollection new.\n\tLiveKernel testClassNames do: [ :className | | cls |\n\t\tcls := Smalltalk globals at: className asSymbol ifAbsent: [ nil ].\n\t\tcls ifNotNil: [\n\t\t\t(cls selectors select: [ :s | s asString beginsWith: 'test' ])\n\t\t\t\tdo: [ :selector | | outcome |\n\t\t\t\t\toutcome := [ cls new perform: selector. nil ]\n\t\t\t\t\t\ton: Error do: [ :e | e ].\n\t\t\t\t\toutcome isNil\n\t\t\t\t\t\tifTrue: [ passed := passed + 1 ]\n\t\t\t\t\t\tifFalse: [\n\t\t\t\t\t\t\tfailed := failed + 1.\n\t\t\t\t\t\t\tdescriptions add: (LiveKernel truncate:\n\t\t\t\t\t\t\t\t(className, '>>', selector asString, ': ', outcome asString)\n\t\t\t\t\t\t\t\tto: 400) ] ] ] ].\n\t^ Dictionary new\n\t\tat: 'run' put: passed + failed;\n\t\tat: 'passed' put: passed;\n\t\tat: 'failed' put: failed;\n\t\tat: 'ok' put: failed = 0;\n\t\tat: 'failures' put: descriptions asArray;\n\t\tyourself"
+    }
+   ]
+  },
+  {
+   "name": "QueueServer",
+   "ivars": "",
+   "package": "LiveKernel",
+   "methods": [
+    {
+     "sel": "queueDir",
+     "classSide": true,
+     "source": "queueDir\n^ LiveKernel dataDir, '/queue'"
+    },
+    {
+     "sel": "ensureQueue",
+     "classSide": true,
+     "source": "ensureQueue\nLiveKernel ensureDir: self queueDir"
+    },
+    {
+     "sel": "loop",
+     "classSide": true,
+     "source": "loop\n| running |\n\tself ensureQueue.\n\tTranscript show: ('LK-READY: queue at ', self queueDir); cr; flush.\n\trunning := true.\n\t[ running ] whileTrue: [\n\t\t| dir |\n\t\tdir := self queueDir asFileReference.\n\t\t(dir entries select: [ :e | (e basename asString endsWith: '.in')\n\t\t\t\tand: [ e isFile ] ])\n\t\t\tasArray\n\t\t\tdo: [ :e | | name content reply outName |\n\t\t\t\tname := e basename asString.\n\t\t\t\tcontent := [ (dir / name) contents ]\n\t\t\t\t\ton: Error do: [ :x | '{}' ].\n\t\t\t\treply := [ self handleJob: content ]\n\t\t\t\t\ton: Error do: [ :er | 'JOB-ERROR: ', er asString ].\n\t\t\t\toutName := name copyFrom: 1 to: name size - 3.\n\t\t\t\t(dir / (outName, '.out'))\n\t\t\t\t\twriteStreamDo: [ :s | s nextPutAll: reply asString ].\n\t\t\t\t[ (dir / name) ensureDelete ] on: Error do: [ :x | ].\n\t\t\t\t(reply = 'SHUTDOWN') ifTrue: [ running := false ] ].\n\t\t[ (dir / 'heartbeat.txt')\n\t\t\twriteStreamDo: [ :s | s nextPutAll: Time millisecondClockValue printString ] ]\n\t\t\ton: Error do: [ :x | ].\n\t\t(Delay forMilliseconds: 100) wait ].\n\tTranscript show: 'LK-BYE'; cr; flush.\n\tSmalltalk snapshot: false andQuit: true"
+    },
+    {
+     "sel": "handleJob:",
+     "classSide": true,
+     "source": "handleJob: jsonText\n| job kind |\n\tjob := [ STONJSON fromString: jsonText ] on: Error do: [ :e | nil ].\n\tjob ifNil: [ ^ LiveKernel truncate: 'ERROR: bad job JSON' to: 800 ].\n\tkind := job at: 'type' ifAbsent: [ 'eval' ].\n\tkind = 'eval' ifTrue: [\n\t\t^ LiveKernel eval: (job at: 'code' ifAbsent: [ 'nil' ]) ].\n\tkind = 'tests' ifTrue: [ ^ STONJSON toString: TestRunner runAll ].\n\tkind = 'status' ifTrue: [ ^ STONJSON toString: LiveKernel status ].\n\tkind = 'promote' ifTrue: [ ^ STONJSON toString: LiveKernel promote ].\n\tkind = 'rollback' ifTrue: [\n\t\t^ STONJSON toString: (LiveKernel rollbackTo:\n\t\t\t(job at: 'marker' ifAbsent: [ 0 ])) ].\n\tkind = 'test_candidate' ifTrue: [\n\t\t^ STONJSON toString: (Supervisor\n\t\t\ttestCandidate: (job at: 'code' ifAbsent: [ 'nil' ])\n\t\t\trepro: (job at: 'repro' ifAbsent: [ nil ])) ].\n\tkind = 'config' ifTrue: [\n\t\t(job at: 'llmUrl' ifAbsent: [ nil ]) ifNotNil: [ :u |\n\t\t\tLiveKernel configAt: 'llmUrl' put: u ].\n\t\t(job at: 'llmModel' ifAbsent: [ nil ]) ifNotNil: [ :md |\n\t\t\tLiveKernel configAt: 'llmModel' put: md ].\n\t\t(job at: 'agentMode' ifAbsent: [ nil ]) ifNotNil: [ :md |\n\t\t\tLiveKernel configAt: 'agentMode' put: md asString ].\n\t\t^ STONJSON toString: LiveKernel status ].\n\tkind = 'heal' ifTrue: [ ^ STONJSON toString: (AgentBridge handleHeal: job) ].\n\tkind = 'healed' ifTrue: [ ^ STONJSON toString: LiveKernel healed ].\n\tkind = 'shutdown' ifTrue: [ ^ 'SHUTDOWN' ].\n\t^ LiveKernel truncate: 'ERROR: unknown job type: ', kind asString to: 800"
+    }
+   ]
+  },
+  {
+   "name": "AgentBridge",
+   "ivars": "",
+   "package": "LiveKernel",
+   "methods": [
+    {
+     "sel": "healDir",
+     "classSide": true,
+     "source": "healDir\n^ LiveKernel dataDir, '/heal'"
+    },
+    {
+     "sel": "ensureHealDir",
+     "classSide": true,
+     "source": "ensureHealDir\nLiveKernel ensureDir: self healDir"
+    },
+    {
+     "sel": "nextId",
+     "classSide": true,
+     "source": "nextId\n| ref n |\n\tself ensureHealDir.\n\tref := (self healDir, '/.seq') asFileReference.\n\tn := ref exists\n\t\tifTrue: [ [ ref contents asInteger ] on: Error do: [ :e | 0 ] ]\n\t\tifFalse: [ 0 ].\n\tn := n + 1.\n\tref writeStreamDo: [ :s | s nextPutAll: n asString ].\n\t^ n"
+    },
+    {
+     "sel": "handleHeal:",
+     "classSide": true,
+     "source": "handleHeal: job\n| id request reqFile respFile answer source verdict swapped |\n\tid := self nextId.\n\trequest := Dictionary new\n\t\tat: 'id' put: id;\n\t\tat: 'problem' put: (job at: 'problem' ifAbsent: [ '' ]);\n\t\tat: 'repro' put: (job at: 'repro' ifAbsent: [ '' ]);\n\t\tat: 'target' put: (job at: 'target' ifAbsent: [ '' ]);\n\t\tat: 'journalSize' put: LiveKernel journal size;\n\t\tyourself.\n\treqFile := (self healDir, '/req-', id asString, '.json') asFileReference.\n\treqFile writeStreamDo: [ :s | s nextPutAll: (STONJSON toString: request) ].\n\trespFile := (self healDir, '/resp-', id asString, '.json') asFileReference.\n\t1 to: 120 do: [ :tick |\n\t\trespFile exists ifFalse: [ (Delay forMilliseconds: 1000) wait ] ].\n\trespFile exists ifFalse: [\n\t\t^ Dictionary new\n\t\t\tat: 'ok' put: false;\n\t\t\tat: 'stage' put: 'supervisor-timeout';\n\t\t\tat: 'id' put: id; yourself ].\n\tanswer := [ STONJSON fromString: respFile contents ]\n\t\ton: Error do: [ :e | nil ].\n\tsource := answer isNil\n\t\tifTrue: [ nil ]\n\t\tifFalse: [ answer at: 'source' ifAbsent: [ nil ] ].\n\tsource ifNil: [\n\t\t^ Dictionary new\n\t\t\tat: 'ok' put: false;\n\t\t\tat: 'stage' put: 'bad-supervisor-response';\n\t\t\tat: 'id' put: id; yourself ].\n\tverdict := Supervisor testCandidate: source\n\t\trepro: (job at: 'repro' ifAbsent: [ nil ]).\n\t(verdict at: 'ok' ifAbsent: [ false ]) ifFalse: [\n\t\t^ (Dictionary new\n\t\t\tat: 'ok' put: false;\n\t\t\tat: 'stage' put: 'shadow-verify-failed';\n\t\t\tat: 'id' put: id;\n\t\t\tat: 'source' put: (LiveKernel truncate: source to: 2000);\n\t\t\tat: 'shadow' put: (verdict at: 'detail' ifAbsent: [ '' ]);\n\t\t\tyourself) ].\n\tswapped := LiveKernel eval: source.\n\t(LiveKernel evalResultFailed: swapped) ifTrue: [\n\t\t^ (Dictionary new\n\t\t\tat: 'ok' put: false;\n\t\t\tat: 'stage' put: 'swap-failed';\n\t\t\tat: 'id' put: id;\n\t\t\tat: 'swapped' put: (LiveKernel truncate: swapped to: 300);\n\t\t\tat: 'source' put: (LiveKernel truncate: source to: 2000);\n\t\t\tyourself) ].\n\tLiveKernel noteHealed: (Dictionary new\n\t\tat: 'id' put: id;\n\t\tat: 'target' put: (job at: 'target' ifAbsent: [ '' ]);\n\t\tat: 'swapResult' put: (LiveKernel truncate: swapped to: 300);\n\t\tat: 'source' put: (LiveKernel truncate: source to: 2000);\n\t\tyourself).\n\t^ Dictionary new\n\t\tat: 'ok' put: true;\n\t\tat: 'id' put: id;\n\t\tat: 'swapped' put: (LiveKernel truncate: swapped to: 300);\n\t\tat: 'source' put: (LiveKernel truncate: source to: 2000);\n\t\tyourself"
+    }
+   ]
+  },
+  {
+   "name": "Supervisor",
+   "ivars": "",
+   "package": "LiveKernel",
+   "methods": [
+    {
+     "sel": "workspaceDir",
+     "classSide": true,
+     "source": "workspaceDir\n^ LiveKernel dataDir, '/workspace'"
+    },
+    {
+     "sel": "writeTemp:contents:extension:",
+     "classSide": true,
+     "source": "writeTemp: prefix contents: aString extension: ext\n| ref |\n\tLiveKernel ensureDir: self workspaceDir.\n\tref := (self workspaceDir, '/', prefix, '-',\n\t\tTime millisecondClockValue printString, '-',\n\t\t(aString asString hash abs \\\\ 99991) printString, '.', ext)\n\t\t\tasFileReference.\n\tref writeStreamDo: [ :s | s nextPutAll: aString asString ].\n\t^ ref"
+    },
+    {
+     "sel": "testCandidate:repro:",
+     "classSide": true,
+     "source": "testCandidate: candidateSource repro: reproSource\n| candFile reproFile outFile driver rc outer |\n\tcandFile := self writeTemp: 'cand' contents: candidateSource extension: 'st'.\n\treproFile := self writeTemp: 'repro'\n\t\tcontents: (reproSource ifNil: [ 'nil' ]) extension: 'st'.\n\toutFile := self writeTemp: 'out' contents: 'PENDING' extension: 'txt'.\n\tdriver := self writeTemp: 'driver'\n\t\tcontents: (self driverForCandidate: candFile repro: reproFile out: outFile)\n\t\textension: 'st'.\n\trc := LibC system: 'DRIVER=', driver fullName printString,\n\t\t' sh /opt/pharo/scripts/shadow_run.sh >/dev/null 2>&1; exit $?'.\n\touter := [ STONJSON fromString: outFile contents ]\n\t\ton: Error do: [ :e | nil ].\n\touter isNil ifTrue: [\n\t\t^ Dictionary new\n\t\t\tat: 'ok' put: false;\n\t\t\tat: 'rc' put: rc;\n\t\t\tat: 'detail' put: 'shadow output missing or malformed';\n\t\t\tyourself ].\n\t^ Dictionary new\n\t\tat: 'ok' put: (outer at: 'ok' ifAbsent: [ false ]);\n\t\tat: 'rc' put: rc;\n\t\tat: 'detail' put: outer;\n\t\tyourself"
+    },
+    {
+     "sel": "driverForCandidate:repro:out:",
+     "classSide": true,
+     "source": "driverForCandidate: candidatePath repro: reproPath out: outPath\n| d q installText |\n\tq := (Character value: 39) asString.\n\tinstallText := '/opt/pharo/kernel/install_eval.st' asFileReference contents.\n\td := WriteStream on: String new.\n\td nextPutAll: installText.\n\td nextPutAll: '.'.\n\td nextPutAll: String cr.\n\td nextPutAll: '(Smalltalk globals at: #LiveKernel) shadowRun: (Dictionary new'.\n\td nextPutAll: ' at: ', q , 'n', q , ' put: ', LiveKernel journal size printString, ';'.\n\td nextPutAll: ' at: ', q , 'candidate', q , ' put: ', q ,\n\t\tcandidatePath fullName, q , ';'.\n\td nextPutAll: ' at: ', q , 'repro', q , ' put: ', q ,\n\t\treproPath fullName, q , ';'.\n\td nextPutAll: ' at: ', q , 'out', q , ' put: ', q ,\n\t\toutPath fullName, q , ';'.\n\td nextPutAll: ' yourself).'.\n\td nextPutAll: String cr , 'Smalltalk snapshot: false andQuit: true.'.\n\t^ d contents"
+    }
+   ]
+  },
+  {
+   "name": "VendingMachine",
+   "ivars": "price paid",
+   "package": "LiveKernelDemo",
+   "methods": [
+    {
+     "sel": "init",
+     "classSide": false,
+     "source": "init\nprice := 50.\n\tpaid := 0"
+    },
+    {
+     "sel": "price:",
+     "classSide": false,
+     "source": "price: anAmount\nprice := anAmount"
+    },
+    {
+     "sel": "insertCoin:",
+     "classSide": false,
+     "source": "insertCoin: anAmount\npaid := paid + anAmount"
+    },
+    {
+     "sel": "dispense",
+     "classSide": false,
+     "source": "dispense\npaid >= price ifFalse: [ self error: 'insufficient credit' ].\n\tpaid := paid - price.\n\t^ 'product'"
+    },
+    {
+     "sel": "make",
+     "classSide": true,
+     "source": "make\n^ self new init"
+    }
+   ]
+  },
+  {
+   "name": "VendingMachineTests",
+   "ivars": "",
+   "package": "LiveKernelDemo",
+   "methods": [
+    {
+     "sel": "verify:description:",
+     "classSide": false,
+     "source": "verify: aBoolean description: desc\naBoolean ifFalse: [ self error: desc ]"
+    },
+    {
+     "sel": "testDispenseAfterCredit",
+     "classSide": false,
+     "source": "testDispenseAfterCredit\n| vm |\n\tvm := VendingMachine make.\n\t3 timesRepeat: [ vm insertCoin: 20 ].\n\tself verify: vm dispense = 'product' description: 'should dispense'"
+    },
+    {
+     "sel": "testInsufficientCreditRaises",
+     "classSide": false,
+     "source": "testInsufficientCreditRaises\n| vm raised |\n\tvm := VendingMachine make.\n\traised := false.\n\t[ vm dispense ] on: Error do: [ :e | raised := true ].\n\tself verify: raised description: 'should raise on empty credit'"
+    }
+   ]
+  }
+ ]
+}

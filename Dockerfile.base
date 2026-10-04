@@ -1,0 +1,18 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+# Headless Pharo VM deps only -- no X11.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates unzip libatomic1 libuuid1 libnuma1 zlib1g procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/pharo
+
+# VM + image from get.pharo.org (Pharo 12). Keep the .sources file: its
+# absence makes snapshot/save prompt-abort the VM.
+RUN curl -sfL https://get.pharo.org/64/120+vm | bash \
+    && mv Pharo.image pharo.image \
+    && mv Pharo.changes pharo.changes
+
+# Smoke: headless eval must work at build time.
+RUN ./pharo-vm/pharo --headless pharo.image eval "2 + 2" | grep -q 4

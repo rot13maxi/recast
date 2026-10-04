@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""lk -- host CLI for the live Smalltalk image (file-queue protocol).
+
+The live VM polls /data/queue/job-*.in, evaluates each job IN THE LIVE IMAGE
+(that IS the hot-swap), writes job-*.out. This CLI writes jobs and waits.
+
+  lk eval 'VendingMachine new init; insertCoin: 60; dispense'
+  lk file kernel/mystuff.st            # fileIn-style eval of a .st file
+  lk tests
+  lk status
+  lk promote                          # bake live state into production (marker++)
+  lk rollback 3                       # next boot replays journal[1..3]
+  lk candidate fix.st [--repro r.st]  # shadow-validate, do NOT touch live image
+  lk heal --problem "dispense crashes" --repro repro.st [--target VendingMachine]
+  lk logs                             # docker compose logs prod
+  lk reset [--yes]                    # wipe /data (back up first)
+"""
+import argparse, json, os, subprocess, sys, time, uuid
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.environ.get("LIVE_DATA", os.path.join(HERE, "data"))
+QUEUE = os.path.join(DATA, "queue")
+COMPOSE = ["docker", "compose", "-f", os.path.join(HERE, "docker-compose.yml")]
+
+
+def send(job, timeout=90):
+    os.makedirs(QUEUE, exist_ok=True)
+    jid = uuid.uuid4().hex[:12]
+    jin = os.path.join(QUEUE, f"job-{jid}.in")
+    jout = os.path.join(QUEUE, f"job-{jid}.out")
+    with open(jin, "w") as f:
+        json.dump(job, f)
+    # 0666 so the image (root in container) can delete it on bind mounts
+    os.chmod(jin, 0o666)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(jout):
+            try:
+                time.sleep(0.05)  # let the write finish
+                with open(jout) as f:
+                    out = f.read()
+            except OSError:
+                time.sleep(0.1); continue
+            os.unlink(jout)
+            return out
+        time.sleep(0.08)
+    if os.path.exists(jin):
+        print(f"TIMEOUT: job {jid} not picked up; live image down?", file=sys.stderr)
+        return None
+    return None
+
+
+def maybe_json(s):
+    try:
+        return json.loads(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def pp(s):
+    j = maybe_json(s)
+    print(json.dumps(j, indent=1) if j is not None else s)
+
+
+def compose(*args, capture=False):
+    return subprocess.run(COMPOSE + list(args), capture_output=capture, text=True)
+
+
+def cmd_eval(a):
+    print(send({"type": "eval", "code": a.code}, timeout=a.timeout))
+
+
+def cmd_file(a):
+    with open(a.path) as f:
+        print(send({"type": "eval", "code": f.read()}, timeout=a.timeout))
+
+
+def cmd_simple(name):
+    out = send({"type": name})
+    if name == "status":
+        out = host_alive(out)
+    pp(out)
+
+
+def host_alive(status_str):
+    """Authoritative liveness: heartbeat file mtime vs host clock."""
+    try:
+        hb = os.path.join(QUEUE, "heartbeat.txt")
+        age = time.time() - os.path.getmtime(hb)
+        j = json.loads(status_str)
+        j["heartbeatAgeSec"] = round(age, 1)
+        j["alive"] = age < 10
+        return json.dumps(j)
+    except (OSError, ValueError):
+        return status_str
+
+
+def cmd_promote(_):
+    pp(send({"type": "promote"}, timeout=120))
+
+
+def cmd_rollback(a):
+    pp(send({"type": "rollback", "marker": a.n}))
+
+
+def cmd_candidate(a):
+    code = open(a.path).read()
+    repro = open(a.repro).read() if a.repro else None
+    pp(send({"type": "test_candidate", "code": code, "repro": repro}, timeout=180))
+
+
+def cmd_heal(a):
+    repro = open(a.repro).read() if a.repro else ""
+    pp(send({"type": "heal", "problem": a.problem, "repro": repro,
+             "target": a.target or ""}, timeout=a.timeout))
+
+
+def cmd_logs(_):
+    compose("logs", "--tail", "100", "prod")
+
+
+def cmd_reset(a):
+    if not a.yes:
+        print("refusing; pass --yes", file=sys.stderr); return 1
+    compose("down")
+    subprocess.run(["bash", "-c", f"rm -rf {DATA}/* {DATA}/.[!.]* 2>/dev/null || true"])
+    compose("up", "-d")
+    print("data wiped, prod restarted from journal=0")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="lk")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    e = sub.add_parser("eval"); e.add_argument("code"); e.add_argument("--timeout", type=float, default=90); e.set_defaults(fn=cmd_eval)
+    f = sub.add_parser("file"); f.add_argument("path"); f.add_argument("--timeout", type=float, default=90); f.set_defaults(fn=cmd_file)
+    for name in ("tests", "status", "healed"):
+        s = sub.add_parser(name); s.set_defaults(fn=lambda _a, n=name: cmd_simple(n))
+    s = sub.add_parser("promote"); s.set_defaults(fn=cmd_promote)
+    s = sub.add_parser("rollback"); s.add_argument("n", type=int); s.set_defaults(fn=cmd_rollback)
+    s = sub.add_parser("candidate"); s.add_argument("path"); s.add_argument("--repro"); s.set_defaults(fn=cmd_candidate)
+    s = sub.add_parser("heal"); s.add_argument("--problem", required=True); s.add_argument("--repro"); s.add_argument("--target"); s.add_argument("--timeout", type=float, default=240); s.set_defaults(fn=cmd_heal)
+    s = sub.add_parser("logs"); s.set_defaults(fn=cmd_logs)
+    s = sub.add_parser("reset"); s.add_argument("--yes", action="store_true"); s.set_defaults(fn=cmd_reset)
+
+    a = p.parse_args()
+    rc = a.fn(a)
+    sys.exit(rc or 0)
+
+
+if __name__ == "__main__":
+    main()

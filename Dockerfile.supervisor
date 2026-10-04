@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY agent/supervisor.py /app/supervisor.py
+CMD ["python", "-u", "/app/supervisor.py"]

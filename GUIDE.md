@@ -1,31 +1,42 @@
 # A tour of Recast
 
-This tour takes you through the full lifecycle: start the image, change code
-while it runs, break the demo app, ask a real LLM to repair it, and promote
-the result so it survives restart. Then let an ordinary failing call trigger
-the investigation and repair loop automatically.
+Break a running Smalltalk application, let an ordinary failing call trigger
+an LLM repair, and watch the next call succeed without a restart. Then promote
+the patch and prove that it survives one.
 
-You can also complete the tour without an API key. Follow the
-[offline path with the fake LLM](#offline-path-use-the-fake-llm) for endpoint
-setup, then rejoin the main walkthrough.
+The main tour covers [setup](#0-configure-the-llm-and-boot),
+[a live edit](#1-hot-swap-a-class), [a deliberate failure](#2-break-the-app),
+[automatic repair](#3-automatic-repair-from-an-ordinary-call), and
+[promotion](#4-promote-and-prove-persistence). The later sections are optional
+experiments and cleanup.
 
-The main path has been validated with a real model: the connection
-check, generated repair, shadow verification, promotion, and restart checks
-all passed. The offline path has also been exercised with the fake endpoint.
+You can complete the tour without an API key using the
+[offline fake LLM](#offline-path-use-the-fake-llm). It supplies canned patches
+through the same verification path; the main tour uses a real model.
+Both paths have been exercised, including real repairs from a real model.
 
-You need Docker with the Compose plugin, Python 3, and an API key for the
-real-LLM path. Run the commands in Bash from the repository root. The examples
-assume a fresh `data/` directory; an existing one resumes its promoted code
-and may give different journal counts or behavior.
+You need Git, Docker with the Compose plugin, Python 3, and an API key for
+your chosen LLM endpoint. Run the commands in Bash. The examples assume a
+fresh `data/` directory; an existing one resumes its promoted definitions
+and can produce different journal counts or behavior.
 
-Two Smalltalk conventions will help: define a class before referencing it by
-name in another eval, and double single quotes inside method source strings.
-The examples below follow both.
+Get the code first:
+
+```bash
+git clone https://github.com/rot13maxi/recast.git
+cd recast
+```
+
+The Smalltalk code is provided below; you do not need to know the language
+to follow the tour. Define classes before referring to them in another eval,
+and double single quotes inside method-source strings.
 
 ## 0. Configure the LLM and boot
 
 The supervisor uses an OpenAI-compatible Chat Completions endpoint. The
-included template uses a real model. Create a local configuration:
+included template uses a real model, which was used to validate
+this tour. You can use another compatible provider or a local model. Create
+a local configuration:
 
 ```bash
 cp .env.example .env
@@ -51,7 +62,8 @@ For a model running on the host, use `host.docker.internal` in the URL so the
 supervisor container can reach it. Leave `LIVE_LLM_API_KEY` empty if that
 endpoint requires no authentication.
 
-Build the Pharo base image once, then start the app and supervisor:
+Build the Pharo base image once, then start the app and supervisor. The
+initial build downloads Pharo and its dependencies:
 
 ```bash
 docker build -f Dockerfile.base -t live-smalltalk-base:latest .
@@ -135,9 +147,11 @@ promotion. Restarting now would rebuild the image without them.
 
 ## 2. Break the app
 
-Replace `dispense` with a method that always raises an error:
+Keep automatic repair off while you inspect the failure. Replace `dispense`
+with a method that always raises an error:
 
 ```bash
+./lk autorepair off
 ./lk eval "VendingMachine compile: 'dispense
   self error: ''the machine is on fire'''. nil"
 
@@ -152,115 +166,17 @@ Replace `dispense` with a method that always raises an error:
 
 The edit compiles, so `lk eval` applies it immediately. The failing suite
 blocks promotion. Restart would discard the unpromoted changes, including
-`Greeting`; next we'll repair the method while the image keeps running.
+`Greeting`. Next, let the failing call itself trigger a repair.
 
-## 3. Ask the LLM to repair it
+## 3. Automatic repair from an ordinary call
 
-`lk heal` sends a problem description, target name, and repro to the
-supervisor. The model gets those fields, but no automatic dump of the class
-or its methods. Give it the fields and behavior it needs to write the fix.
-
-Write a repro that fails on the broken method and returns `true` after a
-successful repair:
-
-```bash
-cat > /tmp/repro.st <<'ST'
-| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
-ST
-
-./lk heal --problem "VendingMachine>>dispense always raises 'the machine is on fire'.
-The class has instance variables price and paid. init sets price := 50 and paid := 0.
-insertCoin: adds its argument to paid. Repair only dispense: if paid < price,
-raise 'insufficient credit'; otherwise subtract price from paid and return 'product'.
-Return Smalltalk statements that compile the method into VendingMachine." \
-  --repro /tmp/repro.st --target VendingMachine
-# Success includes "ok": true. The "swapped" value depends on the source returned.
-```
-
-The supervisor asks the model for source in a fenced Smalltalk code block.
-The image then starts a separate VM, replays the journal, evaluates the
-candidate, and runs the repro and suite. A green verdict allows the live
-image to apply the patch. The request can take a few seconds or longer,
-depending on the endpoint.
-
-Confirm the result in the live image:
-
-```bash
-./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
-# -> 'product'
-./lk tests
-# "ok": true
-./lk healed
-ls data/heal/
-```
-
-`lk healed` lists successful repairs. The request and response files in
-`data/heal/` preserve proposals, including rejected ones. The response also
-records the model name. The repaired method is still tentative until you
-promote it.
-
-If the repair fails, use the returned `stage` to find the cause:
-
-| Stage | What to check |
-|-------|---------------|
-| `supervisor-timeout` | The image waited about 120 seconds for a response. Check `docker compose ps` and `docker compose logs --tail 50 supervisor`. |
-| `bad-supervisor-response` | Inspect the matching `data/heal/resp-N.json` for an endpoint error, then rerun the connection check in section 0. |
-| `shadow-verify-failed` | The proposed source did not pass compilation, the repro, or the suite. Inspect `source` and `shadow` in the result; clarify the problem and issue a new heal request. |
-| `swap-failed` | The candidate passed in the shadow VM but failed during live evaluation. Inspect the result and live logs. |
-
-A real model may produce a rejected proposal. Continue once the heal returns
-`ok: true` and the live checks pass. The gate verifies tested behavior; it
-does not establish that arbitrary model-generated code is safe.
-
-## 4. Promote and prove persistence
-
-Promotion advances the marker to include all journalled definitions: the
-`Greeting` class, its method, the broken `dispense`, and the later repair.
-On replay, the repair replaces the broken method before the queue starts.
-
-```bash
-./lk promote
-# "ok": true, "marker": N
-docker compose restart prod
-./lk status
-# journalSize: N, marker: N
-./lk eval "Greeting new greet: 'again'"
-# -> 'hello, again!'
-./lk tests
-# "ok": true
-```
-
-The restarted VM loaded the base image and replayed the promoted journal.
-It did not restore a saved heap snapshot.
-
-Now try an unpromoted edit:
-
-```bash
-./lk eval "Greeting compile: 'greet: name
-  ^ ''bonjour, '', name'. nil"
-./lk eval "Greeting new greet: 'maintenant'"
-# -> 'bonjour, maintenant'
-docker compose restart prod
-./lk status
-./lk eval "Greeting new greet: 'again'"
-# -> 'hello, again!'
-```
-
-The promoted method survives; the tentative replacement is left unapplied
-on restart. The journal can still contain entries beyond the marker, so
-`journalSize` may be larger than `marker`.
-
-## Automatic repair from an ordinary call
-
-After completing section 4, try the same repair without `lk heal`. Enable
-incident handling and break the vending method:
+The method is still broken. Enable incident handling, then make another
+ordinary application call:
 
 ```bash
 ./lk autorepair on
-./lk eval "VendingMachine compile: 'dispense
-  self error: ''automatic repair demo'''. nil"
 ./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
-# -> ERROR: Error: automatic repair demo
+# -> ERROR: Error: the machine is on fire
 ./lk incidents
 ```
 
@@ -303,17 +219,128 @@ start investigations. Receivers and arguments must contain small literal
 values; complex object graphs are skipped. The original failed operation is
 never automatically retried.
 
-Disable automatic repair before continuing the remaining detours:
+Turn automatic repair off after the experiment. This cancels pending work
+and leaves accepted patches in place:
 
 ```bash
 ./lk autorepair off
 ```
 
-## 5. Verify a candidate and try rollback
+## 4. Promote and prove persistence
+
+Promotion advances the marker to include all journalled definitions: the
+`Greeting` class, its method, the broken `dispense`, and the later repair.
+On replay, the repair replaces the broken method before the queue starts.
+
+```bash
+./lk promote
+# "ok": true, "marker": N
+docker compose restart prod
+./lk status
+# journalSize: N, marker: N
+./lk eval "Greeting new greet: 'again'"
+# -> 'hello, again!'
+./lk tests
+# "ok": true
+```
+
+The restarted VM loaded the base image and replayed the promoted journal.
+It did not restore a saved heap snapshot.
+
+Now try an unpromoted edit:
+
+```bash
+./lk eval "Greeting compile: 'greet: name
+  ^ ''bonjour, '', name'. nil"
+./lk eval "Greeting new greet: 'maintenant'"
+# -> 'bonjour, maintenant'
+docker compose restart prod
+./lk status
+./lk eval "Greeting new greet: 'again'"
+# -> 'hello, again!'
+```
+
+The promoted method survives; the tentative replacement is left unapplied
+on restart. The journal can still contain entries beyond the marker, so
+`journalSize` may be larger than `marker`.
+
+## 5. Optional: request a repair explicitly
+
+You can also drive repair directly with `lk heal`. This is useful when you
+already have a repro or want to supply additional context. Break the method
+again for this separate experiment:
+
+```bash
+./lk autorepair off
+./lk eval "VendingMachine compile: 'dispense
+  self error: ''the machine is on fire'''. nil"
+```
+
+`lk heal` sends a problem description, target name, and repro to the
+supervisor. The model gets those fields, but no automatic dump of the class
+or its methods. Give it the fields and behavior it needs to write the fix.
+
+Write a repro that fails on the broken method and returns `true` after a
+successful repair:
+
+```bash
+cat > /tmp/repro.st <<'ST'
+| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
+ST
+
+./lk heal --problem "VendingMachine>>dispense always raises 'the machine is on fire'.
+The class has instance variables price and paid. init sets price := 50 and paid := 0.
+insertCoin: adds its argument to paid. Repair only dispense: if paid < price,
+raise 'insufficient credit'; otherwise subtract price from paid and return 'product'.
+Return Smalltalk statements that compile the method into VendingMachine." \
+  --repro /tmp/repro.st --target VendingMachine
+# Success includes "ok": true. The "swapped" value depends on the source returned.
+```
+
+The supervisor asks the model for source in a fenced Smalltalk code block.
+The image then starts a separate VM, replays the journal, evaluates the
+candidate, and runs the repro and suite. A green verdict allows the live
+image to apply the patch. The request can take a few seconds or longer,
+depending on the endpoint.
+
+Confirm the result in the live image:
+
+```bash
+./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
+# -> 'product'
+./lk tests
+# "ok": true
+./lk healed
+ls data/heal/
+```
+
+`lk healed` lists successful repairs. The request and response files in
+`data/heal/` preserve proposals, including rejected ones. The response also
+records the model name. The repaired method is still tentative until you
+promote it. Run `./lk promote` after the live checks pass if you want to
+retain this repair.
+
+If the repair fails, use the returned `stage` to find the cause:
+
+| Stage | What to check |
+|-------|---------------|
+| `supervisor-timeout` | The image waited about 120 seconds for a response. Check `docker compose ps` and `docker compose logs --tail 50 supervisor`. |
+| `bad-supervisor-response` | Inspect the matching `data/heal/resp-N.json` for an endpoint error, then rerun the connection check in section 0. |
+| `shadow-verify-failed` | The proposed source did not pass compilation, the repro, or the suite. Inspect `source` and `shadow` in the result; clarify the problem and issue a new heal request. |
+| `swap-failed` | The candidate passed in the shadow VM but failed during live evaluation. Inspect the result and live logs. |
+
+A real model may produce a rejected proposal. Continue once the heal returns
+`ok: true` and the live checks pass. The gate verifies tested behavior; it
+does not establish that arbitrary model-generated code is safe.
+
+## 6. Optional: verify a candidate and try rollback
 
 To check a patch without changing the live image:
 
 ```bash
+cat > /tmp/repro.st <<'ST'
+| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
+ST
 cat > /tmp/fix.st <<'ST'
 VendingMachine compile: 'dispense
   paid >= price ifFalse: [ self error: ''insufficient credit'' ].
@@ -339,7 +366,7 @@ docker compose restart prod
 # fresh image, journalSize: 0, marker: 0
 ```
 
-## 6. Stop and clean up
+## 7. Stop and clean up
 
 ```bash
 docker compose down
@@ -363,7 +390,8 @@ kill "$FAKE_LLM_PID"
 
 The fake endpoint returns predefined Smalltalk patches. It exercises the
 same request, verification, and swap path without model inference or an API
-key. Use this setup instead of the real endpoint configuration in section 0:
+key. From the repository root, use this setup instead of the real endpoint
+configuration in section 0:
 
 ```bash
 export LIVE_LLM_URL=http://host.docker.internal:8899/v1/chat/completions
@@ -382,16 +410,18 @@ curl -s http://localhost:8899 -o /dev/null -w '%{http_code}\n'
 ```
 
 Continue with [the base-image build and boot in section 0](#0-configure-the-llm-and-boot),
-including the connection check, then follow sections 1–6. If the containers
-are already running, apply these endpoint variables with:
+including the connection check, then follow the main tour in sections 1–4.
+Sections 5–6 are optional; section 7 handles cleanup. If the containers are
+already running, apply these endpoint variables with:
 
 ```bash
 docker compose up -d --force-recreate supervisor
 ```
 
-The repair request in section 3 contains `dispense`, which selects the
-predefined correct method. For a deterministic rejection demo, run this
-**after breaking the method in section 2 and before repairing it in section 3**:
+The automatic incident in section 3 includes `dispense`, which selects the
+predefined correct method. The explicit request in section 5 selects it too.
+For a deterministic rejection demo, run this **after breaking the method in
+section 2 and before enabling automatic repair in section 3**:
 
 ```bash
 ./lk heal --problem "anything BOGUS-marker" --target VendingMachine

@@ -22,6 +22,9 @@ FIX = {"model": "gpt-4o-mini", "choices": [{"message": {"content":
 BOGUS = {"model": "gpt-4o-mini", "choices": [{"message": {"content":
     "```smalltalk\nVendingMachine compile: 'dispense\n\t^ ''SABOTAGED'''\n```"}}]}
 
+NILLIKE = {"model": "gpt-4o-mini", "choices": [{"message": {"content":
+    "```smalltalk\nnil\n```"}}]}
+
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):

@@ -17,13 +17,15 @@ directory (`live-smalltalk/`).
 
 ```bash
 docker compose up -d --build          # prod VM + supervisor
-python3 test/fakellm.py &           # canned "LLM" for the self-heal demo
+python3 test/fakellm.py &           # canned "LLM" on :8899 for the self-heal demo
 sleep 12                            # VM boots: base image + journal replay + REPL
 ./lk status
 ```
 
-`status` is your liveness check — the image heartbeats to `/data/queue/`
-and the CLI measures the file mtime:
+`fakellm.py` prints nothing when healthy (it logs nothing); confirm with
+`curl -s localhost:8899 -o /dev/null -w '%{http_code}\n'` — anything but
+`000` means it's listening. `status` is your image liveness check — the
+image heartbeats to `/data/queue/` and the CLI measures the file mtime:
 
 ```json
 { "alive": true, "journalSize": 0, "marker": 0, "heartbeatAgeSec": 0.0,
@@ -74,6 +76,10 @@ No build, no deploy, no restart — `Greeting` exists in the live image right
 now. It's journalled so a restart *could* reproduce it, but it's **tentative**
 until promoted (we'll see what that means in §4).
 
+Heads-up: `./lk logs` is ~90% `DeprecationPerformedNotification` noise
+triggered by the `Object subclass:` idiom itself. It's harmless if you see
+`LK-BOOT: replayed N entries, 0 failures`; only growing LK- lines matter.
+
 ## 2. See it fail: break prod
 
 Sabotage the vending machine — this compiles fine, so it hot-swaps in, and
@@ -114,6 +120,11 @@ shadow verdict is green.
 The canned `fakellm.py` plays the LLM: if the prompt mentions `dispense` it
 returns the correct fixed method, if it mentions `BOGUS` it returns a
 sabotage patch (so you can watch the gate reject it).
+If `lk heal` ever answers `"stage": "supervisor-timeout"` (~2 min), the
+supervisor container is down (`docker compose ps`). `"stage":
+"bad-supervisor-response"` or an `error` in `data/heal/resp-N.json` means
+fakellm.py died or the problem text hit an unhandled branch (see its
+docstring). Always `curl`-check 8899 before §3.
 
 First, watch the gate work — ask for a fix whose prompt trips `BOGUS`:
 
@@ -188,8 +199,13 @@ The promoted `greet:` survives; the tentative one evaporates with the VM.
 
 ## 5. Optional detours
 
+Run these **last** — `rollback 0` + restart and `reset --yes` are
+destructive to everything above (rollback 0 makes `Greeting` undeclared
+again in the live image; `reset --yes` also wipes the `data/heal` audit
+trail). They are the rewind-to-zero path, not part of the spine.
+
 ```bash
-./lk logs                        # prod VM logs
+./lk logs                        # prod VM logs (see the §1 noise warning)
 # shadow-validate a patch WITHOUT touching the live image:
 cat > /tmp/fix.st <<'EOF'
 VendingMachine compile: 'dispense
@@ -201,8 +217,8 @@ cat > /tmp/r.st <<'EOF'
 | vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
 EOF
 ./lk candidate /tmp/fix.st --repro /tmp/r.st   # "ok": true; live image untouched
-./lk rollback 0 && docker compose restart prod   # full rewind
-./lk reset --yes                 # wipe /data, reboot pristine
+./lk rollback 0 && docker compose restart prod # rewind: Greeting gone again
+./lk reset --yes                 # wipe /data entirely, reboot pristine
 ```
 
 ## 6. Stop and clean up
@@ -227,8 +243,12 @@ export LIVE_LLM_API_KEY=***
 docker compose up -d --force-recreate supervisor
 ```
 
+Back to canned mode: `unset LIVE_LLM_URL LIVE_LLM_MODEL LIVE_LLM_API_KEY`
+then `docker compose up -d --force-recreate supervisor`.
+
 The contract the model must satisfy: reply with a fenced ```smalltalk block
 whose contents are Smalltalk statements that compile into place (method
 `compile:` sources, class definitions...). Anything it hallucinates dies in
 the shadow VM, so be as adversarial with your endpoint as you like — try
 `fakellm.py`'s sabotage mode if you want to see the trust model hold.
+

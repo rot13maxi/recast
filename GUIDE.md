@@ -13,7 +13,7 @@ experiments and cleanup.
 You can complete the tour without an API key using the
 [offline fake LLM](#offline-path-use-the-fake-llm). It supplies canned patches
 through the same verification path; the main tour uses a real model.
-Both paths have been exercised, including real repairs from a real model.
+Both paths have been exercised, including repairs from a real LLM.
 
 You need Git, Docker with the Compose plugin, Python 3, and an API key for
 your chosen LLM endpoint. Run the commands in Bash. The examples assume a
@@ -34,19 +34,18 @@ and double single quotes inside method-source strings.
 ## 0. Configure the LLM and boot
 
 The supervisor uses an OpenAI-compatible Chat Completions endpoint. The
-included template uses a real model, which was used to validate
-this tour. You can use another compatible provider or a local model. Create
-a local configuration:
+included template contains an OpenAI example. You can use another compatible
+provider or a local model. Create a local configuration:
 
 ```bash
 cp .env.example .env
 ```
 
-Fill in `LIVE_LLM_API_KEY` in `.env`, leaving the other values as shown:
+Set your endpoint, model, and API key in `.env`. For OpenAI, the example is:
 
 ```dotenv
 LIVE_LLM_URL=https://api.openai.com/v1/chat/completions
-LIVE_LLM_MODEL=current
+LIVE_LLM_MODEL=gpt-4o-mini
 LIVE_LLM_API_KEY=your-api-key
 ```
 
@@ -201,7 +200,7 @@ while the model and shadow VM work:
 # "ok": true
 ```
 
-This path has been validated with a real model. The patch remains
+This path has been validated with a real LLM. The patch remains
 tentative; use `./lk promote` if you want it to survive restart.
 
 The model may instead return `expected` or `insufficient-evidence`. Other

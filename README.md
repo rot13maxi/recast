@@ -28,8 +28,7 @@ $ ./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
 
 The first call still fails. Investigation and verification run asynchronously;
 the image applies the accepted patch, and the next call succeeds. This path
-has been exercised with a real LLM through an OpenAI-compatible endpoint on
-Pharo 12.
+has been exercised with a real LLM on Pharo 12.
 
 **[Take the tour in GUIDE.md](GUIDE.md)** to reproduce it: boot, edit live code,
 break the app, trigger automatic repair, and promote the result. You can also
@@ -118,13 +117,12 @@ docker compose up -d --build
 ./lk tests
 ```
 
-The template uses `https://api.openai.com/v1/chat/completions` with
-model `current`, the endpoint used for validation. Other compatible providers
-and local models can be configured with the supervisor's request format; the
-GUIDE explains
-the configuration and includes a connection check from inside the container.
-If `.env` already exists, edit it instead of overwriting it. It is ignored by Git.
-The first build downloads Pharo and its dependencies.
+The template includes an OpenAI example endpoint and model. You can configure
+another compatible provider or a local model. The GUIDE explains the request
+format and includes a connection check from inside the container. Real-model
+repair runs have been validated; check your chosen endpoint before starting
+the tour. If `.env` already exists, edit it instead of overwriting it. It is
+ignored by Git. The first build downloads Pharo and its dependencies.
 
 Continue with [the GUIDE](GUIDE.md) for the failure-to-repair experiment.
 The command-line interface also exposes each part of the loop:

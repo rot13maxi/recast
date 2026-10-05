@@ -23,8 +23,9 @@ sleep 12                            # VM boots: base image + journal replay + RE
 ```
 
 `fakellm.py` prints nothing when healthy (it logs nothing); confirm with
-`curl -s localhost:8899 -o /dev/null -w '%{http_code}\n'` — anything but
-`000` means it's listening. `status` is your image liveness check — the
+`curl -s localhost:8899 -o /dev/null -w '%{http_code}\n'` — expect `501`
+(it's POST-only; rejecting a GET proves it's listening). `000` = dead.
+`status` is your image liveness check — the
 image heartbeats to `/data/queue/` and the CLI measures the file mtime:
 
 ```json
@@ -158,7 +159,7 @@ Audit trail:
 ./lk tests        # green again
 ./lk healed       # SUCCESSFUL heals only: id, target, source, swapResult
                   # (rejection like the BOGUS one is NOT recorded here — it lives
-                  #  only in data/heal/req-1.json; ls that dir for the full record)
+                  #  only in data/heal/req-1.json (+ its resp-1.json); ls that dir
 ls data/heal/     # req-N.json / resp-N.json — the raw proposals
 ```
 
@@ -218,6 +219,8 @@ cat > /tmp/r.st <<'EOF'
 EOF
 ./lk candidate /tmp/fix.st --repro /tmp/r.st   # "ok": true; live image untouched
 ./lk rollback 0 && docker compose restart prod # rewind: Greeting gone again
+sleep 12
+./lk eval "Greeting new greet: 'gone'"   # ERROR: ...Undeclared variable->Greeting
 ./lk reset --yes                 # wipe /data entirely, reboot pristine
 ```
 

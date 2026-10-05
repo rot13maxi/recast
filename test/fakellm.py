@@ -38,6 +38,10 @@ class H(BaseHTTPRequestHandler):
             resp = FIX
         else:
             resp = NILLIKE
+        if "ONE JSON object" in prompt:
+            source = resp["choices"][0]["message"]["content"].split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            decision = {"decision": "repair", "reason": "Offline fixture: restore the vending contract.", "source": source}
+            resp = {"choices": [{"message": {"content": json.dumps(decision)}}]}
         out = json.dumps(resp).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

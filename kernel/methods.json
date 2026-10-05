@@ -63,12 +63,17 @@
     {
      "sel": "eval:",
      "classSide": true,
-     "source": "eval: sourceString\n| source before result clean |\n\tsource := sourceString asString.\n\tbefore := Smalltalk globals keys asSet.\n\tresult := self evalQuiet: source.\n\t((source beginsWith: '// nojournal') not\n\t\tand: [ self isDefinition: source ]) ifTrue: [\n\t\tclean := ((result beginsWith: 'ERROR:')\n\t\t\tor: [ (result beginsWith: 'EXCEPTION:')\n\t\t\tor: [ (result beginsWith: 'NOTIFICATION:') ] ]) not.\n\t\tclean ifTrue: [\n\t\t\tself journalAppend: source.\n\t\t\t(Smalltalk globals keys asSet difference: before) do: [ :sym |\n\t\t\t\t(sym asString endsWith: 'Tests')\n\t\t\t\t\tifTrue: [ self addTestClassNamed: sym asString ] ] ] ].\n\t^ result"
+     "source": "eval: sourceString\n| source before result clean |\n\tsource := sourceString asString.\n\tbefore := Smalltalk globals keys asSet.\n\tresult := self evalQuiet: source onError: [ :error |\n        (self isDefinition: source) ifFalse: [\n            LLMRepairService current ifNotNil: [ :service |\n                [ service capture: error source: source ] on: Error do: [ :captureError |\n                    Transcript show: 'LK-INCIDENT-ERROR: ', captureError asString; cr; flush ] ] ] ].\n\t((source beginsWith: '// nojournal') not\n\t\tand: [ self isDefinition: source ]) ifTrue: [\n\t\tclean := ((result beginsWith: 'ERROR:')\n\t\t\tor: [ (result beginsWith: 'EXCEPTION:')\n\t\t\tor: [ (result beginsWith: 'NOTIFICATION:') ] ]) not.\n\t\tclean ifTrue: [\n\t\t\tself journalAppend: source.\n\t\t\t(Smalltalk globals keys asSet difference: before) do: [ :sym |\n\t\t\t\t(sym asString endsWith: 'Tests')\n\t\t\t\t\tifTrue: [ self addTestClassNamed: sym asString ] ] ] ].\n\t^ result"
     },
     {
      "sel": "evalQuiet:",
      "classSide": true,
-     "source": "evalQuiet: sourceString\n| result wrapped |\n\twrapped := '[' , sourceString asString , '] value'.\n\tresult := [ Smalltalk compiler evaluate: wrapped ]\n\t\ton: Error do: [ :e | ^ 'ERROR: ', e asString ].\n\t^ result isNil\n\t\tifTrue: [ 'nil' ]\n\t\tifFalse: [ [ result printString ]\n\t\t\ton: Error do: [ :e | 'a ', result class name asString ] ]"
+     "source": "evalQuiet: sourceString\n^ self evalQuiet: sourceString onError: [ :error | ]"
+    },
+    {
+     "sel": "evalQuiet:onError:",
+     "classSide": true,
+     "source": "evalQuiet: sourceString onError: handler\n| result wrapped |\n    wrapped := '[' , sourceString asString , '] value'.\n    result := [ Smalltalk compiler evaluate: wrapped ]\n        on: Error do: [ :error | handler value: error. ^ 'ERROR: ', error asString ].\n    ^ result isNil ifTrue: [ 'nil' ] ifFalse: [\n        [ result printString ] on: Error do: [ :error | 'a ', result class name asString ] ]"
     },
     {
      "sel": "truncate:to:",
@@ -143,7 +148,7 @@
     {
      "sel": "status",
      "classSide": true,
-     "source": "status\n| hb age |\n\thb := (self pathFor: 'queue/heartbeat.txt') asFileReference.\n\tage := hb exists\n\t\tifTrue: [ [ (Time millisecondClockValue - hb contents asInteger) abs ]\n\t\t\ton: Error do: [ :e | -2 ] ]\n\t\tifFalse: [ -1 ].\n\t^ (Dictionary new\n\t\tat: 'journalSize' put: self journal size;\n\t\tat: 'marker' put: self marker;\n\t\tat: 'testClasses' put: self testClassNames;\n\t\tat: 'healedCount' put: self healed size;\n\t\tat: 'agentMode' put: (self configAt: 'agentMode' default: 'live');\n\t\tat: 'llmModel' put: (self configAt: 'llmModel' default: '');\n\t\tat: 'heartbeatAgeSec' put: age;\n\t\tat: 'alive' put: (age >= 0 and: [ age < 30 ]);\n\t\tyourself)"
+     "source": "status\n| hb age |\n\thb := (self pathFor: 'queue/heartbeat.txt') asFileReference.\n\tage := hb exists\n\t\tifTrue: [ [ (Time millisecondClockValue - hb contents asInteger) abs ]\n\t\t\ton: Error do: [ :e | -2 ] ]\n\t\tifFalse: [ -1 ].\n\t^ (Dictionary new\n\t\tat: 'journalSize' put: self journal size;\n\t\tat: 'marker' put: self marker;\n\t\tat: 'testClasses' put: self testClassNames;\n\t\tat: 'healedCount' put: self healed size;\n        at: 'automaticRepair' put: (self configAt: 'automaticRepair' default: false);\n\t\tat: 'agentMode' put: (self configAt: 'agentMode' default: 'live');\n\t\tat: 'llmModel' put: (self configAt: 'llmModel' default: '');\n\t\tat: 'heartbeatAgeSec' put: age;\n\t\tat: 'alive' put: (age >= 0 and: [ age < 30 ]);\n\t\tyourself)"
     }
    ]
   },
@@ -177,12 +182,12 @@
     {
      "sel": "loop",
      "classSide": true,
-     "source": "loop\n| running |\n\tself ensureQueue.\n\tTranscript show: ('LK-READY: queue at ', self queueDir); cr; flush.\n\trunning := true.\n\t[ running ] whileTrue: [\n\t\t| dir |\n\t\tdir := self queueDir asFileReference.\n\t\t(dir entries select: [ :e | (e basename asString endsWith: '.in')\n\t\t\t\tand: [ e isFile ] ])\n\t\t\tasArray\n\t\t\tdo: [ :e | | name content reply outName |\n\t\t\t\tname := e basename asString.\n\t\t\t\tcontent := [ (dir / name) contents ]\n\t\t\t\t\ton: Error do: [ :x | '{}' ].\n\t\t\t\treply := [ self handleJob: content ]\n\t\t\t\t\ton: Error do: [ :er | 'JOB-ERROR: ', er asString ].\n\t\t\t\toutName := name copyFrom: 1 to: name size - 3.\n\t\t\t\t(dir / (outName, '.out'))\n\t\t\t\t\twriteStreamDo: [ :s | s nextPutAll: reply asString ].\n\t\t\t\t[ (dir / name) ensureDelete ] on: Error do: [ :x | ].\n\t\t\t\t(reply = 'SHUTDOWN') ifTrue: [ running := false ] ].\n\t\t[ (dir / 'heartbeat.txt')\n\t\t\twriteStreamDo: [ :s | s nextPutAll: Time millisecondClockValue printString ] ]\n\t\t\ton: Error do: [ :x | ].\n\t\t(Delay forMilliseconds: 100) wait ].\n\tTranscript show: 'LK-BYE'; cr; flush.\n\tSmalltalk snapshot: false andQuit: true"
+     "source": "loop\n| running |\n    LLMRepairService start.\n\tself ensureQueue.\n\tTranscript show: ('LK-READY: queue at ', self queueDir); cr; flush.\n\trunning := true.\n\t[ running ] whileTrue: [\n\t\t| dir |\n\t\tdir := self queueDir asFileReference.\n\t\t(dir entries select: [ :e | (e basename asString endsWith: '.in')\n\t\t\t\tand: [ e isFile ] ])\n\t\t\tasArray\n\t\t\tdo: [ :e | | name content reply outName |\n\t\t\t\tname := e basename asString.\n\t\t\t\tcontent := [ (dir / name) contents ]\n\t\t\t\t\ton: Error do: [ :x | '{}' ].\n\t\t\t\treply := [ self handleJob: content ]\n\t\t\t\t\ton: Error do: [ :er | 'JOB-ERROR: ', er asString ].\n\t\t\t\toutName := name copyFrom: 1 to: name size - 3.\n\t\t\t\t(dir / (outName, '.out'))\n\t\t\t\t\twriteStreamDo: [ :s | s nextPutAll: reply asString ].\n\t\t\t\t[ (dir / name) ensureDelete ] on: Error do: [ :x | ].\n\t\t\t\t(reply = 'SHUTDOWN') ifTrue: [ running := false ] ].\n        [ LLMRepairService current poll ] on: Error do: [ :error |\n            Transcript show: 'LK-REPAIR-ERROR: ', error asString; cr; flush ].\n\t\t[ (dir / 'heartbeat.txt')\n\t\t\twriteStreamDo: [ :s | s nextPutAll: Time millisecondClockValue printString ] ]\n\t\t\ton: Error do: [ :x | ].\n\t\t(Delay forMilliseconds: 100) wait ].\n\tTranscript show: 'LK-BYE'; cr; flush.\n\tSmalltalk snapshot: false andQuit: true"
     },
     {
      "sel": "handleJob:",
      "classSide": true,
-     "source": "handleJob: jsonText\n| job kind |\n\tjob := [ STONJSON fromString: jsonText ] on: Error do: [ :e | nil ].\n\tjob ifNil: [ ^ LiveKernel truncate: 'ERROR: bad job JSON' to: 800 ].\n\tkind := job at: 'type' ifAbsent: [ 'eval' ].\n\tkind = 'eval' ifTrue: [\n\t\t^ LiveKernel eval: (job at: 'code' ifAbsent: [ 'nil' ]) ].\n\tkind = 'tests' ifTrue: [ ^ STONJSON toString: TestRunner runAll ].\n\tkind = 'status' ifTrue: [ ^ STONJSON toString: LiveKernel status ].\n\tkind = 'promote' ifTrue: [ ^ STONJSON toString: LiveKernel promote ].\n\tkind = 'rollback' ifTrue: [\n\t\t^ STONJSON toString: (LiveKernel rollbackTo:\n\t\t\t(job at: 'marker' ifAbsent: [ 0 ])) ].\n\tkind = 'test_candidate' ifTrue: [\n\t\t^ STONJSON toString: (Supervisor\n\t\t\ttestCandidate: (job at: 'code' ifAbsent: [ 'nil' ])\n\t\t\trepro: (job at: 'repro' ifAbsent: [ nil ])) ].\n\tkind = 'config' ifTrue: [\n\t\t(job at: 'llmUrl' ifAbsent: [ nil ]) ifNotNil: [ :u |\n\t\t\tLiveKernel configAt: 'llmUrl' put: u ].\n\t\t(job at: 'llmModel' ifAbsent: [ nil ]) ifNotNil: [ :md |\n\t\t\tLiveKernel configAt: 'llmModel' put: md ].\n\t\t(job at: 'agentMode' ifAbsent: [ nil ]) ifNotNil: [ :md |\n\t\t\tLiveKernel configAt: 'agentMode' put: md asString ].\n\t\t^ STONJSON toString: LiveKernel status ].\n\tkind = 'heal' ifTrue: [ ^ STONJSON toString: (AgentBridge handleHeal: job) ].\n\tkind = 'healed' ifTrue: [ ^ STONJSON toString: LiveKernel healed ].\n\tkind = 'shutdown' ifTrue: [ ^ 'SHUTDOWN' ].\n\t^ LiveKernel truncate: 'ERROR: unknown job type: ', kind asString to: 800"
+     "source": "handleJob: jsonText\n| job kind |\n\tjob := [ STONJSON fromString: jsonText ] on: Error do: [ :e | nil ].\n\tjob ifNil: [ ^ LiveKernel truncate: 'ERROR: bad job JSON' to: 800 ].\n\tkind := job at: 'type' ifAbsent: [ 'eval' ].\n\tkind = 'eval' ifTrue: [\n\t\t^ LiveKernel eval: (job at: 'code' ifAbsent: [ 'nil' ]) ].\n\tkind = 'tests' ifTrue: [ ^ STONJSON toString: TestRunner runAll ].\n\tkind = 'status' ifTrue: [ ^ STONJSON toString: LiveKernel status ].\n\tkind = 'promote' ifTrue: [ ^ STONJSON toString: LiveKernel promote ].\n\tkind = 'rollback' ifTrue: [\n\t\t^ STONJSON toString: (LiveKernel rollbackTo:\n\t\t\t(job at: 'marker' ifAbsent: [ 0 ])) ].\n\tkind = 'test_candidate' ifTrue: [\n\t\t^ STONJSON toString: (Supervisor\n\t\t\ttestCandidate: (job at: 'code' ifAbsent: [ 'nil' ])\n\t\t\trepro: (job at: 'repro' ifAbsent: [ nil ])) ].\n\tkind = 'config' ifTrue: [\n\t\t(job at: 'llmUrl' ifAbsent: [ nil ]) ifNotNil: [ :u |\n\t\t\tLiveKernel configAt: 'llmUrl' put: u ].\n\t\t(job at: 'llmModel' ifAbsent: [ nil ]) ifNotNil: [ :md |\n\t\t\tLiveKernel configAt: 'llmModel' put: md ].\n        (job at: 'automaticRepair' ifAbsent: [ nil ]) ifNotNil: [ :enabled |\n            LiveKernel configAt: 'automaticRepair' put: enabled ].\n\t\t(job at: 'agentMode' ifAbsent: [ nil ]) ifNotNil: [ :md |\n\t\t\tLiveKernel configAt: 'agentMode' put: md asString ].\n\t\t^ STONJSON toString: LiveKernel status ].\n\tkind = 'heal' ifTrue: [ ^ STONJSON toString: (AgentBridge handleHeal: job) ].\n\tkind = 'incidents' ifTrue: [ ^ STONJSON toString: LLMRepairService current incidents ].\n\tkind = 'healed' ifTrue: [ ^ STONJSON toString: LiveKernel healed ].\n\tkind = 'shutdown' ifTrue: [ ^ 'SHUTDOWN' ].\n\t^ LiveKernel truncate: 'ERROR: unknown job type: ', kind asString to: 800"
     }
    ]
   },
@@ -218,6 +223,11 @@
    "ivars": "",
    "package": "LiveKernel",
    "methods": [
+    {
+     "sel": "startCandidate:repro:",
+     "classSide": true,
+     "source": "startCandidate: candidateSource repro: reproSource\n| candFile reproFile outFile driver |\n    candFile := self writeTemp: 'auto-cand' contents: candidateSource extension: 'st'.\n    reproFile := self writeTemp: 'auto-repro' contents: reproSource extension: 'st'.\n    outFile := self writeTemp: 'auto-out' contents: 'PENDING' extension: 'txt'.\n    driver := self writeTemp: 'auto-driver'\n        contents: (self driverForCandidate: candFile repro: reproFile out: outFile) extension: 'st'.\n    LibC system: 'DRIVER=', driver fullName printString,\n        ' sh /opt/pharo/scripts/shadow_run.sh >/dev/null 2>&1 &'.\n    ^ outFile fullName"
+    },
     {
      "sel": "workspaceDir",
      "classSide": true,
@@ -269,6 +279,16 @@
      "sel": "make",
      "classSide": true,
      "source": "make\n^ self new init"
+    },
+    {
+     "sel": "repairContract",
+     "classSide": true,
+     "source": "repairContract\n^ 'A vending machine starts with price 50 and paid 0. insertCoin: adds credit. dispense must raise insufficient credit when paid < price; otherwise it subtracts price from paid and returns product. Repair behavior without changing the public protocol or instance variable layout.'"
+    },
+    {
+     "sel": "repairExpectedErrors",
+     "classSide": true,
+     "source": "repairExpectedErrors\n^ #('insufficient credit')"
     }
    ]
   },
@@ -291,6 +311,68 @@
      "sel": "testInsufficientCreditRaises",
      "classSide": false,
      "source": "testInsufficientCreditRaises\n| vm raised |\n\tvm := VendingMachine make.\n\traised := false.\n\t[ vm dispense ] on: Error do: [ :e | raised := true ].\n\tself verify: raised description: 'should raise on empty credit'"
+    }
+   ]
+  },
+  {
+   "name": "LLMRepairService",
+   "ivars": "pending history",
+   "package": "LiveKernel",
+   "methods": [
+    {
+     "sel": "current",
+     "classSide": true,
+     "source": "current\n^ Smalltalk globals at: #LKRepairService ifAbsent: [ nil ]"
+    },
+    {
+     "sel": "start",
+     "classSide": true,
+     "source": "start\nSmalltalk globals at: #LKRepairService put: self new initialize"
+    },
+    {
+     "sel": "initialize",
+     "classSide": false,
+     "source": "initialize\npending := Dictionary new.\n history := (LiveKernel readJson: 'incidents.json' default: #()) asOrderedCollection.\n history do: [ :incident |\n   (#('awaiting-model' 'verifying') includes: (incident at: 'status')) ifTrue: [\n     incident at: 'status' put: 'cancelled-on-restart' ] ].\n self save.\n ^ self"
+    },
+    {
+     "sel": "save",
+     "classSide": false,
+     "source": "save\nLiveKernel writeJson: 'incidents.json' value: history asArray"
+    },
+    {
+     "sel": "incidents",
+     "classSide": false,
+     "source": "incidents\n^ history asArray"
+    },
+    {
+     "sel": "literal:",
+     "classSide": false,
+     "source": "literal: value\n(value isNil or: [ value == true or: [ value == false ] ]) ifTrue: [ ^ value printString ].\n (value isNumber or: [ value isString or: [ value isSymbol ] ]) ifTrue: [\n   value printString size <= 1000 ifTrue: [ ^ value printString ] ].\n ^ nil"
+    },
+    {
+     "sel": "capture:source:",
+     "classSide": false,
+     "source": "capture: error source: operation\n| context frames allowed target receiver selector method fingerprint state arguments repro request incident id sourceText contract tests |\n (LiveKernel configAt: 'automaticRepair' default: false) = true ifFalse: [ ^ nil ].\n pending size >= 8 ifTrue: [ ^ nil ].\n allowed := LiveKernel configAt: 'repairClasses' default: #('VendingMachine').\n context := error signalerContext.\n frames := OrderedCollection new.\n target := nil.\n 1 to: 40 do: [ :index |\n   context ifNotNil: [\n     frames add: (LiveKernel truncate: context methodClass name asString, '>>', context selector asString to: 200).\n     target isNil ifTrue: [\n       ((allowed includes: context receiver class name asString)\n         and: [ allowed includes: context methodClass name asString ]) ifTrue: [ target := context ] ].\n     context := context sender ] ].\n target ifNil: [ ^ nil ].\n receiver := target receiver.\n (receiver class respondsTo: #repairContract) ifFalse: [ ^ nil ].\n (receiver class respondsTo: #repairExpectedErrors) ifTrue: [\n   (receiver class repairExpectedErrors includes: error messageText) ifTrue: [ ^ nil ] ].\n selector := target selector.\n method := target method.\n fingerprint := receiver class name asString, '>>', selector asString, ':', method sourceCode hash asString, ':', error class name asString, ':', error messageText.\n (history anySatisfy: [ :entry | (entry at: 'fingerprint') = fingerprint ]) ifTrue: [ ^ nil ].\n state := Dictionary new.\n repro := WriteStream on: String new.\n repro nextPutAll: '| receiver | receiver := (Smalltalk globals at: #', receiver class name asString, ') basicNew.'.\n receiver class allInstVarNames withIndexDo: [ :name :index | | literal |\n   literal := self literal: (receiver instVarAt: index).\n   literal ifNil: [ ^ nil ].\n   state at: name put: literal.\n   repro nextPutAll: ' receiver instVarAt: ', index asString, ' put: ', literal, '.' ].\n arguments := target arguments collect: [ :value | self literal: value ].\n (arguments anySatisfy: [ :value | value isNil ]) ifTrue: [ ^ nil ].\n repro nextPutAll: ' receiver perform: #', selector asString, ' withArguments: {'.\n arguments withIndexDo: [ :literal :index |\n   index > 1 ifTrue: [ repro nextPutAll: '. ' ]. repro nextPutAll: literal ].\n repro nextPutAll: '}. true'.\n sourceText := WriteStream on: String new.\n receiver class selectors sorted do: [ :sel |\n   sourceText nextPutAll: (receiver class >> sel) sourceCode; cr; cr ].\n receiver class class selectors sorted do: [ :sel |\n   sourceText nextPutAll: receiver class name asString, ' class>>'; nextPutAll: (receiver class class >> sel) sourceCode; cr; cr ].\n tests := WriteStream on: String new.\n LiveKernel testClassNames do: [ :name | | testClass |\n   testClass := Smalltalk globals at: name asSymbol ifAbsent: [ nil ].\n   testClass ifNotNil: [ testClass selectors sorted do: [ :sel |\n     tests nextPutAll: name, '>>'; nextPutAll: (testClass >> sel) sourceCode; cr; cr ] ] ].\n contract := receiver class repairContract.\n id := AgentBridge nextId.\n request := Dictionary new\n   at: 'id' put: id; at: 'kind' put: 'incident';\n   at: 'problem' put: error class name asString, ': ', error messageText;\n   at: 'target' put: receiver class name asString;\n   at: 'selector' put: selector asString;\n   at: 'repro' put: repro contents;\n   at: 'operation' put: (LiveKernel truncate: operation to: 2000);\n   at: 'stack' put: frames asArray; at: 'state' put: state;\n   at: 'classSource' put: (LiveKernel truncate: sourceText contents to: 16000);\n   at: 'testsSource' put: (LiveKernel truncate: tests contents to: 12000);\n   at: 'contract' put: contract;\n   at: 'journalSize' put: LiveKernel journal size; yourself.\n incident := Dictionary new\n   at: 'id' put: id; at: 'target' put: (request at: 'target');\n   at: 'selector' put: selector asString; at: 'problem' put: (request at: 'problem');\n   at: 'fingerprint' put: fingerprint; at: 'status' put: 'awaiting-model';\n   at: 'journalSize' put: LiveKernel journal size;\n   at: 'started' put: Time millisecondClockValue;\n   at: 'request' put: request; yourself.\n history add: incident. pending at: id put: incident. self save.\n LiveKernel writeJson: 'heal/req-', id asString, '.json' value: request.\n ^ id"
+    },
+    {
+     "sel": "finish:status:detail:",
+     "classSide": false,
+     "source": "finish: incident status: status detail: detail\nincident at: 'status' put: status; at: 'detail' put: detail.\n incident removeKey: 'request' ifAbsent: [ ].\n incident removeKey: 'started' ifAbsent: [ ].\n pending removeKey: (incident at: 'id') ifAbsent: [ ].\n self save"
+    },
+    {
+     "sel": "allowedSource:for:",
+     "classSide": false,
+     "source": "allowedSource: source for: incident\n| ast statements node method |\n ast := RBParser parseExpression: source.\n statements := ast isSequence ifTrue: [ ast statements ] ifFalse: [ { ast } ].\n statements size = 1 ifFalse: [ ^ false ].\n node := statements first.\n (node isMessage and: [ node selector = #compile: ]) ifFalse: [ ^ false ].\n (node receiver isVariable and: [ node receiver name asString = (incident at: 'target') ]) ifFalse: [ ^ false ].\n (node arguments size = 1 and: [ node arguments first isLiteralNode ]) ifFalse: [ ^ false ].\n node arguments first value isString ifFalse: [ ^ false ].\n method := RBParser parseMethod: node arguments first value.\n ^ method selector asString = (incident at: 'selector')"
+    },
+    {
+     "sel": "poll",
+     "classSide": false,
+     "source": "poll\npending values asArray do: [ :incident |\n   [ self advance: incident ] on: Error do: [ :error |\n     self finish: incident status: 'repair-error' detail: error asString ] ]"
+    },
+    {
+     "sel": "advance:",
+     "classSide": false,
+     "source": "advance: incident\n| response file request source decision verdict result |\n (LiveKernel configAt: 'automaticRepair' default: false) = true ifFalse: [\n   ^ self finish: incident status: 'cancelled' detail: 'automatic repair disabled' ].\n LiveKernel journal size = (incident at: 'journalSize') ifFalse: [\n   ^ self finish: incident status: 'stale' detail: 'code changed during investigation' ].\n request := incident at: 'request'.\n (incident at: 'status') = 'awaiting-model' ifTrue: [\n   (Time millisecondClockValue - (incident at: 'started')) > 300000 ifTrue: [\n     ^ self finish: incident status: 'supervisor-timeout' detail: 'no decision within 300 seconds' ].\n   file := (AgentBridge healDir, '/resp-', (incident at: 'id') asString, '.json') asFileReference.\n   file exists ifFalse: [ ^ nil ].\n   response := STONJSON fromString: file contents.\n   (response at: 'id' ifAbsent: [ nil ]) = (incident at: 'id') ifFalse: [\n     ^ self finish: incident status: 'bad-supervisor-response' detail: 'response id mismatch' ].\n   decision := response at: 'decision' ifAbsent: [ 'invalid' ].\n   (#('expected' 'insufficient-evidence') includes: decision) ifTrue: [\n     ^ self finish: incident status: decision detail: (response at: 'reason' ifAbsent: [ '' ]) ].\n   source := response at: 'source' ifAbsent: [ nil ].\n   (decision = 'repair' and: [ source isString and: [ source isEmpty not ] ]) ifFalse: [\n     ^ self finish: incident status: 'bad-supervisor-response' detail: (response at: 'error' ifAbsent: [ 'invalid repair decision' ]) ].\n   (self allowedSource: source for: incident) ifFalse: [\n     ^ self finish: incident status: 'out-of-scope' detail: 'automatic repairs must compile only the failing application method' ].\n   incident at: 'source' put: source;\n     at: 'reason' put: (response at: 'reason' ifAbsent: [ '' ]);\n     at: 'outPath' put: (Supervisor startCandidate: source repro: (request at: 'repro'));\n     at: 'status' put: 'verifying'; at: 'started' put: Time millisecondClockValue.\n   self save. ^ nil ].\n file := (incident at: 'outPath') asFileReference.\n (Time millisecondClockValue - (incident at: 'started')) > 150000 ifTrue: [\n   ^ self finish: incident status: 'shadow-timeout' detail: 'shadow did not finish' ].\n file exists ifFalse: [ ^ nil ].\n verdict := [ STONJSON fromString: file contents ] on: Error do: [ :error | nil ].\n verdict ifNil: [ ^ nil ].\n (verdict at: 'ok' ifAbsent: [ false ]) = true ifFalse: [\n   ^ self finish: incident status: 'shadow-verify-failed' detail: verdict ].\n result := LiveKernel eval: (incident at: 'source').\n (LiveKernel evalResultFailed: result) ifTrue: [\n   ^ self finish: incident status: 'swap-failed' detail: result ].\n LiveKernel noteHealed: (Dictionary new at: 'id' put: (incident at: 'id');\n   at: 'target' put: (incident at: 'target'); at: 'source' put: (incident at: 'source');\n   at: 'swapResult' put: result; at: 'automatic' put: true; yourself).\n self finish: incident status: 'repaired' detail: verdict"
     }
    ]
   }

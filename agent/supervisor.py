@@ -5,7 +5,7 @@ Watches /data/heal/req-N.json written by the image (AgentBridge), asks an
 OpenAI-compatible chat endpoint for a fix, writes /data/heal/resp-N.json.
 The IMAGE decides whether to swap: a returned patch only ever lands if the
 image's own shadow-VM (base + journal + candidate + repro + suite) says OK.
-This process can therefore be adversarial and nothing bad happens.
+Automatic incidents receive an explicit investigation decision before verification.
 
 Env:
   HEAL_DIR          default ./data/heal
@@ -33,30 +33,67 @@ Rules:
 """
 
 
-def call_llm(req):
-    prompt = (f"Target: {req.get('target','')}\n"
-              f"Problem: {req.get('problem','')}\n"
-              f"Repro (Smalltalk that currently misbehaves):\n"
-              f"```\n{req.get('repro','')}\n```\n"
-              f"Journal size: {req.get('journalSize')}")
+INVESTIGATE_SYSTEM = """You investigate failures in a live Pharo Smalltalk application.
+Use the captured stack, source, receiver state, tests, and application contract.
+Decide whether the failure is expected, lacks sufficient evidence, or needs repair.
+Reply with ONE JSON object, optionally inside a json fence:
+{"decision": "expected" | "insufficient-evidence" | "repair", "reason": "...", "source": "..."}
+For repair, source must be the SMALLEST Smalltalk statements that compile the fix
+into the target class: one TargetClass compile: statement for the captured selector.
+Single quotes inside compile: strings must be doubled.
+Do not change tests, repair policy, kernel classes, or instance variable layouts.
+Do not access files, APIs, globals holding live application state, or run tests.
+Use the contract and existing tests as the specification. A raised exception by
+itself does not imply a bug. For other decisions omit source.
+"""
+
+
+def chat(req, system):
     body = json.dumps({
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": prompt}],
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": json.dumps(req)}],
         "temperature": 0.2,
     }).encode()
-    r = urllib.request.Request(LLM_URL, data=body, headers={
+    request = urllib.request.Request(LLM_URL, data=body, headers={
         "Content-Type": "application/json",
         **({"Authorization": f"Bearer {LLM_KEY}"} if LLM_KEY else {})})
-    with urllib.request.urlopen(r, timeout=120) as resp:
+    with urllib.request.urlopen(request, timeout=120) as resp:
         data = json.loads(resp.read())
-    text = data["choices"][0]["message"]["content"]
+    content = data["choices"][0]["message"]["content"]
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Endpoint returned no text")
+    return content.strip()
+
+
+def extract_source(text):
     fences = re.findall(r"```(?:st|smalltalk)?\s*\n(.*?)```", text, re.S)
-    source = ("\n".join(f.strip() for f in fences)).strip()
-    if not source:
-        source = text.strip()
-    return source
+    return ("\n".join(f.strip() for f in fences)).strip() if fences else text.strip()
+
+
+def call_llm(req):
+    return extract_source(chat(req, SYSTEM))
+
+
+def investigate(req):
+    text = chat(req, INVESTIGATE_SYSTEM)
+    fence = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n?```", text, re.S)
+    answer = json.loads(fence.group(1) if fence else text)
+    if not isinstance(answer, dict):
+        raise ValueError("Investigation must return an object")
+    decision = answer.get("decision")
+    if decision not in ("expected", "insufficient-evidence", "repair"):
+        raise ValueError("Invalid investigation decision")
+    reason = answer.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("Investigation must explain its decision")
+    result = {"decision": decision, "reason": reason}
+    if decision == "repair":
+        source = answer.get("source")
+        if not isinstance(source, str) or not source.strip():
+            raise ValueError("Repair decision requires source")
+        result["source"] = extract_source(source)
+    return result
 
 
 def already_handled(f):
@@ -79,23 +116,23 @@ def process(f):
     if os.path.exists(resp_path):
         return
     print(f"[supervisor] healing req {rid}: {req.get('problem','')[:80]}")
-    try:
-        source = call_llm(req)
-    except Exception as e:
-        print(f"[supervisor] LLM failed for {rid}: {e}", file=sys.stderr)
-        time.sleep(2)
+    payload = None
+    for attempt in range(2):
         try:
-            source = call_llm(req)
-        except Exception as e2:
-            with open(resp_path, "w") as fh:
-                json.dump({"id": rid, "error": str(e2)}, fh)
-            return
+            payload = investigate(req) if req.get("kind") == "incident" else {"source": call_llm(req)}
+            break
+        except Exception as e:
+            print(f"[supervisor] LLM failed for {rid}: {e}", file=sys.stderr)
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                payload = {"error": str(e)}
+    payload.update(id=rid, supervisor="llm", model=LLM_MODEL)
     tmp = resp_path + ".tmp"
     with open(tmp, "w") as fh:
-        json.dump({"id": rid, "source": source,
-                   "supervisor": "llm", "model": LLM_MODEL}, fh)
-    os.rename(tmp, resp_path)
-    print(f"[supervisor] answered req {rid} ({len(source)} chars)")
+        json.dump(payload, fh)
+    os.replace(tmp, resp_path)
+    print(f"[supervisor] answered req {rid} ({payload.get('decision', 'proposal')})")
 
 
 def main():

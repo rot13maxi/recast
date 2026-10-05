@@ -7,6 +7,8 @@ The live VM polls /data/queue/job-*.in, evaluates each job IN THE LIVE IMAGE
   lk eval 'VendingMachine new init; insertCoin: 60; dispense'
   lk file kernel/mystuff.st            # fileIn-style eval of a .st file
   lk tests
+  lk autorepair on|off               # opt into incident-driven repair
+  lk incidents                      # automatic investigation/repair audit
   lk status
   lk promote                          # bake live state into production (marker++)
   lk rollback 3                       # next boot replays journal[1..3]
@@ -153,8 +155,9 @@ def main():
 
     e = sub.add_parser("eval"); e.add_argument("code"); e.add_argument("--timeout", type=float, default=90); e.set_defaults(fn=cmd_eval)
     f = sub.add_parser("file"); f.add_argument("path"); f.add_argument("--timeout", type=float, default=90); f.set_defaults(fn=cmd_file)
-    for name in ("tests", "status", "healed"):
+    for name in ("tests", "status", "healed", "incidents"):
         s = sub.add_parser(name); s.set_defaults(fn=lambda _a, n=name: cmd_simple(n))
+    s = sub.add_parser("autorepair"); s.add_argument("mode", choices=("on", "off")); s.set_defaults(fn=lambda a: pp(host_alive(send({"type": "config", "automaticRepair": a.mode == "on"}))))
     s = sub.add_parser("promote"); s.set_defaults(fn=cmd_promote)
     s = sub.add_parser("rollback"); s.add_argument("n", type=int); s.set_defaults(fn=cmd_rollback)
     s = sub.add_parser("candidate"); s.add_argument("path"); s.add_argument("--repro"); s.set_defaults(fn=cmd_candidate)

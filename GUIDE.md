@@ -1,59 +1,113 @@
-# Getting started
+# A tour of Recast
 
-A guided tour of the whole lifecycle: boot → see it work → break prod →
-watch the self-heal loop fix it → ship a new feature → promote, persist,
-tear down. Every command below was run verbatim against this repo.
+This tour takes you through the full lifecycle: start the image, change code
+while it runs, break the demo app, ask a real LLM to repair it, and promote
+the result so it survives restart. Then let an ordinary failing call trigger
+the investigation and repair loop automatically.
 
-**Prereqs:** Docker with the compose plugin, Python 3 on the host. From this
-directory (`live-smalltalk/`).
+You can also complete the tour without an API key. Follow the
+[offline path with the fake LLM](#offline-path-use-the-fake-llm) for endpoint
+setup, then rejoin the main walkthrough.
 
-> The two Pharo landmines this tour will bite you on if you freelance:
-> a class defined in an `lk eval` can't be referenced by name *in the same*
-> eval (undeclared at compile time) — define in one eval, use in the next.
-> And only sources that compile clean are journalled, so `promote` never
-> bakes a syntax error.
+The main path has been validated with a real model: the connection
+check, generated repair, shadow verification, promotion, and restart checks
+all passed. The offline path has also been exercised with the fake endpoint.
 
-## 0. Boot
+You need Docker with the Compose plugin, Python 3, and an API key for the
+real-LLM path. Run the commands in Bash from the repository root. The examples
+assume a fresh `data/` directory; an existing one resumes its promoted code
+and may give different journal counts or behavior.
+
+Two Smalltalk conventions will help: define a class before referencing it by
+name in another eval, and double single quotes inside method source strings.
+The examples below follow both.
+
+## 0. Configure the LLM and boot
+
+The supervisor uses an OpenAI-compatible Chat Completions endpoint. The
+included template uses a real model. Create a local configuration:
 
 ```bash
-docker compose up -d --build          # prod VM + supervisor
-python3 test/fakellm.py &           # canned "LLM" on :8899 for the self-heal demo
-sleep 12                            # VM boots: base image + journal replay + REPL
+cp .env.example .env
+```
+
+Fill in `LIVE_LLM_API_KEY` in `.env`, leaving the other values as shown:
+
+```dotenv
+LIVE_LLM_URL=https://api.openai.com/v1/chat/completions
+LIVE_LLM_MODEL=current
+LIVE_LLM_API_KEY=your-api-key
+```
+
+Compose reads `.env` automatically. The file is ignored by Git. If `.env`
+already exists, edit it rather than copying the template over it. Exported
+shell variables override `.env`; unset any old `LIVE_LLM_*` exports when
+switching back to this configuration.
+
+For another provider or a local model, set the full chat-completions URL and
+its model name. The supervisor sends `messages` and `temperature: 0.2` and
+reads `choices[0].message.content`, so the endpoint must support that format.
+For a model running on the host, use `host.docker.internal` in the URL so the
+supervisor container can reach it. Leave `LIVE_LLM_API_KEY` empty if that
+endpoint requires no authentication.
+
+Build the Pharo base image once, then start the app and supervisor:
+
+```bash
+docker build -f Dockerfile.base -t live-smalltalk-base:latest .
+docker compose up -d --build
 ./lk status
 ```
 
-`fakellm.py` prints nothing when healthy (it logs nothing); confirm with
-`curl -s localhost:8899 -o /dev/null -w '%{http_code}\n'` — expect `501`
-(it's POST-only; rejecting a GET proves it's listening). `000` = dead.
-`status` is your image liveness check — the
-image heartbeats to `/data/queue/` and the CLI measures the file mtime:
+`lk status` waits for the queue to answer, so there is no fixed boot delay to
+guess. On a fresh boot, expect these fields (additional fields are omitted):
 
 ```json
-{ "alive": true, "journalSize": 0, "marker": 0, "heartbeatAgeSec": 0.0,
-  "agentMode": "live", "testClasses": ["VendingMachineTests"], "...": "..." }
+{ "alive": true, "journalSize": 0, "marker": 0,
+  "agentMode": "live", "testClasses": ["VendingMachineTests"] }
 ```
 
-The app inside is one demo class, `VendingMachine`: insert coins until you
-have 50, `dispense` returns `'product'`.
+`alive` comes from the heartbeat file's age. A queue timeout means the image
+has not answered; inspect `docker compose ps` and `./lk logs` before continuing.
+
+Check the LLM connection **from the supervisor container**, using the same
+client code that will handle the repair:
+
+```bash
+docker compose exec -T supervisor python - <<'PY'
+from supervisor import call_llm
+source = call_llm({
+    'target': 'VendingMachine',
+    'problem': 'Connection check only: return the Smalltalk expression nil.',
+    'repro': '',
+    'journalSize': 0,
+})
+assert source.strip(), 'Endpoint returned no source'
+print('LLM connection OK; received source (not applied).')
+PY
+```
+
+This makes one model request without applying the answer. Authentication,
+model-access, and network errors appear here before you break the app. If
+you change endpoint variables later, recreate the supervisor with
+`docker compose up -d --force-recreate supervisor`.
+
+The demo app is `VendingMachine`. Its price starts at 50; inserting enough
+credit lets `dispense` return `'product'`:
 
 ```bash
 ./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
-```
-
-prints `'product'`. That command was **evaluated inside the running
-production VM** — the output is the VM's `printString` of the result.
-
-Green baseline suite:
-
-```bash
+# -> 'product'
 ./lk tests
-# "run": 2, "ok": true  — VendingMachineTests
+# "run": 2, "ok": true
 ```
 
-## 1. See it work: hot-swap a class, no restart
+The eval ran inside the live VM. Its output is the result's Smalltalk
+`printString`.
 
-Smalltalk's trick — compile a brand-new class into the running VM and use
-it seconds later. Two evals, because define-and-use can't share one eval:
+## 1. Hot-swap a class
+
+Create a class, compile a method, and call it without restarting:
 
 ```bash
 ./lk eval "Smalltalk globals at: #Greeting ifAbsent: [
@@ -63,28 +117,25 @@ it seconds later. Two evals, because define-and-use can't share one eval:
 ./lk eval "Greeting compile: 'greet: name
   ^ ''hello, '', name , ''!'''. nil"
 
-./lk eval "Greeting new greet: 'world'"        # -> 'hello, world!'
+./lk eval "Greeting new greet: 'world'"
+# -> 'hello, world!'
 ```
 
-Quote-logic for `compile:` inside a shell arg: the method source is itself
-a Smalltalk string, so *every* quote inside it doubles. The literal `'!'`
-becomes `''!''` **inside** the outer string, which then needs its own
-closing quote → three quotes in a row (`!'''`). An odd number of quotes
-silently eats the rest as a comment or errors `Unmatched '` — that's the
-same trap the README's landmine list documents.
+These are separate evals because `Greeting` must exist when the expressions
+that reference it compile. Inside the `compile:` string, `''hello, ''` and
+`''!''` represent quoted strings in the method body. The third quote after
+`!` closes the outer source string.
 
-No build, no deploy, no restart — `Greeting` exists in the live image right
-now. It's journalled so a restart *could* reproduce it, but it's **tentative**
-until promoted (we'll see what that means in §4).
+The new definitions are live and journalled, but remain tentative until
+promotion. Restarting now would rebuild the image without them.
 
-Heads-up: `./lk logs` is ~90% `DeprecationPerformedNotification` noise
-triggered by the `Object subclass:` idiom itself. It's harmless if you see
-`LK-BOOT: replayed N entries, 0 failures`; only growing LK- lines matter.
+`./lk logs` may include `DeprecationPerformedNotification` messages from the
+`Object subclass:` idiom. For boot status, look for
+`LK-BOOT: replayed N entries, 0 failures`.
 
-## 2. See it fail: break prod
+## 2. Break the app
 
-Sabotage the vending machine — this compiles fine, so it hot-swaps in, and
-now `dispense` always raises:
+Replace `dispense` with a method that always raises an error:
 
 ```bash
 ./lk eval "VendingMachine compile: 'dispense
@@ -92,166 +143,273 @@ now `dispense` always raises:
 
 ./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
 # -> ERROR: Error: the machine is on fire
-#    (raised errors come back "ERROR: <ErrorClass>: <description>", NOT
-#     "EXCEPTION:" — evalQuiet returns that shape; don't grep for EXCEPTION)
+
+./lk tests
+# "ok": false
+./lk promote
+# "ok": false, "why": "refusing to promote: tests failing"
 ```
 
-The gate notices:
+The edit compiles, so `lk eval` applies it immediately. The failing suite
+blocks promotion. Restart would discard the unpromoted changes, including
+`Greeting`; next we'll repair the method while the image keeps running.
+
+## 3. Ask the LLM to repair it
+
+`lk heal` sends a problem description, target name, and repro to the
+supervisor. The model gets those fields, but no automatic dump of the class
+or its methods. Give it the fields and behavior it needs to write the fix.
+
+Write a repro that fails on the broken method and returns `true` after a
+successful repair:
 
 ```bash
-./lk tests        # "ok": false — testDispenseAfterCredit fails
-./lk promote      # refuses: "ok": false, "why": "refusing to promote: tests failing"
-```
-
-**Production can't bake a regression** — promote is gated on the suite, and
-the suite runs *in the image itself*. You could also `docker compose restart
-prod` right now and the sabotage would vanish (un-promoted journal entries
-die on restart). But the point of this demo is the other fix path...
-
-## 3. Self-heal: the LLM proposes, the image disposes
-
-The supervisor container is the LLM's hands; the image never trusts them.
-`lk heal` has the image write a request (`/data/heal/req-N.json`) with the
-problem, a repro script, and the broken target class; the supervisor polls,
-calls the LLM, and writes back a proposed patch. Then **the image** applies
-the patch in a throwaway shadow VM (fresh VM, journal replayed, candidate
-applied, repro + full suite run) and only hot-swaps it into prod if the
-shadow verdict is green.
-
-The canned `fakellm.py` plays the LLM: if the prompt mentions `dispense` it
-returns the correct fixed method, if it mentions `BOGUS` it returns a
-sabotage patch (so you can watch the gate reject it).
-If `lk heal` ever answers `"stage": "supervisor-timeout"` (~2 min), the
-supervisor container is down (`docker compose ps`). `"stage":
-"bad-supervisor-response"` or an `error` in `data/heal/resp-N.json` means
-fakellm.py died or the problem text hit an unhandled branch (see its
-docstring). Always `curl`-check 8899 before §3.
-
-First, watch the gate work — ask for a fix whose prompt trips `BOGUS`:
-
-```bash
-./lk heal --problem "anything BOGUS-marker" \
-          --target VendingMachine
-# "ok": false, "stage": "shadow-verify-failed"
-# prod untouched, sabotage caught in the shadow VM
-```
-
-Now the real heal. Write a repro (any expression that errors on the broken
-code and returns something non-`false`/`nil` when fixed):
-
-```bash
-cat > /tmp/repro.st <<'EOF'
+cat > /tmp/repro.st <<'ST'
 | vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
-EOF
+ST
 
-./lk heal --problem "dispense always raises 'the machine is on fire'" \
-          --repro /tmp/repro.st --target VendingMachine
-# "ok": true, "swapped": "#dispense"  (takes a few s: poll + shadow VM run)
+./lk heal --problem "VendingMachine>>dispense always raises 'the machine is on fire'.
+The class has instance variables price and paid. init sets price := 50 and paid := 0.
+insertCoin: adds its argument to paid. Repair only dispense: if paid < price,
+raise 'insufficient credit'; otherwise subtract price from paid and return 'product'.
+Return Smalltalk statements that compile the method into VendingMachine." \
+  --repro /tmp/repro.st --target VendingMachine
+# Success includes "ok": true. The "swapped" value depends on the source returned.
+```
 
+The supervisor asks the model for source in a fenced Smalltalk code block.
+The image then starts a separate VM, replays the journal, evaluates the
+candidate, and runs the repro and suite. A green verdict allows the live
+image to apply the patch. The request can take a few seconds or longer,
+depending on the endpoint.
+
+Confirm the result in the live image:
+
+```bash
 ./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
-# -> 'product'   ← fixed, live, no restart — the image compiled the LLM's
-#                   patch into itself after the shadow VM said green
+# -> 'product'
+./lk tests
+# "ok": true
+./lk healed
+ls data/heal/
 ```
 
-Audit trail:
+`lk healed` lists successful repairs. The request and response files in
+`data/heal/` preserve proposals, including rejected ones. The response also
+records the model name. The repaired method is still tentative until you
+promote it.
+
+If the repair fails, use the returned `stage` to find the cause:
+
+| Stage | What to check |
+|-------|---------------|
+| `supervisor-timeout` | The image waited about 120 seconds for a response. Check `docker compose ps` and `docker compose logs --tail 50 supervisor`. |
+| `bad-supervisor-response` | Inspect the matching `data/heal/resp-N.json` for an endpoint error, then rerun the connection check in section 0. |
+| `shadow-verify-failed` | The proposed source did not pass compilation, the repro, or the suite. Inspect `source` and `shadow` in the result; clarify the problem and issue a new heal request. |
+| `swap-failed` | The candidate passed in the shadow VM but failed during live evaluation. Inspect the result and live logs. |
+
+A real model may produce a rejected proposal. Continue once the heal returns
+`ok: true` and the live checks pass. The gate verifies tested behavior; it
+does not establish that arbitrary model-generated code is safe.
+
+## 4. Promote and prove persistence
+
+Promotion advances the marker to include all journalled definitions: the
+`Greeting` class, its method, the broken `dispense`, and the later repair.
+On replay, the repair replaces the broken method before the queue starts.
 
 ```bash
-./lk tests        # green again
-./lk healed       # SUCCESSFUL heals only: id, target, source, swapResult
-                  # (rejection like the BOGUS one is NOT recorded here — it lives
-                  #  only in data/heal/req-1.json (+ its resp-1.json); ls that dir
-ls data/heal/     # req-N.json / resp-N.json — the raw proposals
-```
-
-Note the fix is **tentative** right now. If the "LLM" had been subtly wrong
-and the suite too weak to catch it, `docker compose restart prod` would roll
-it back — the shadow-verified-but-unpromoted state is your bake window.
-
-## 4. Ship the feature: promote, then prove persistence
-
-Promote bakes *all* journalled definitions (the new `Greeting`, the healed
-`dispense`) into production by advancing the marker:
-
-```bash
-./lk promote      # "ok": true, "marker": N  (refuses first if anything is red)
+./lk promote
+# "ok": true, "marker": N
 docker compose restart prod
-sleep 12
-./lk status       # journalSize: N, marker: N — boot replays exactly these
-./lk eval "Greeting new greet: 'again'"     # -> 'hello, again!'
-./lk tests        # still green
+./lk status
+# journalSize: N, marker: N
+./lk eval "Greeting new greet: 'again'"
+# -> 'hello, again!'
+./lk tests
+# "ok": true
 ```
 
-The restarted VM rebuilt itself from `base.image` + the promoted journal —
-deterministic boot, no saved-state snapshots, and `rollback <n>` + restart
-rewinds to any older bake point.
+The restarted VM loaded the base image and replayed the promoted journal.
+It did not restore a saved heap snapshot.
 
-Try the tentative window yourself:
+Now try an unpromoted edit:
 
 ```bash
 ./lk eval "Greeting compile: 'greet: name
   ^ ''bonjour, '', name'. nil"
-./lk eval "Greeting new greet: 'maintenant'"   # -> 'bonjour, maintenant'
-docker compose restart prod                     # tentative edit dies here
-sleep 12
-./lk eval "Greeting new greet: 'again'"         # -> 'hello, again!'
+./lk eval "Greeting new greet: 'maintenant'"
+# -> 'bonjour, maintenant'
+docker compose restart prod
+./lk status
+./lk eval "Greeting new greet: 'again'"
+# -> 'hello, again!'
 ```
 
-The promoted `greet:` survives; the tentative one evaporates with the VM.
+The promoted method survives; the tentative replacement is left unapplied
+on restart. The journal can still contain entries beyond the marker, so
+`journalSize` may be larger than `marker`.
 
-## 5. Optional detours
+## Automatic repair from an ordinary call
 
-Run these **last** — `rollback 0` + restart and `reset --yes` are
-destructive to everything above (rollback 0 makes `Greeting` undeclared
-again in the live image; `reset --yes` also wipes the `data/heal` audit
-trail). They are the rewind-to-zero path, not part of the spine.
+After completing section 4, try the same repair without `lk heal`. Enable
+incident handling and break the vending method:
 
 ```bash
-./lk logs                        # prod VM logs (see the §1 noise warning)
-# shadow-validate a patch WITHOUT touching the live image:
-cat > /tmp/fix.st <<'EOF'
+./lk autorepair on
+./lk eval "VendingMachine compile: 'dispense
+  self error: ''automatic repair demo'''. nil"
+./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
+# -> ERROR: Error: automatic repair demo
+./lk incidents
+```
+
+The failing call returns its error and queues an investigation. The captured
+request supplies the stack, application source, receiver's price and credit,
+existing tests, and the `VendingMachine` repair contract. No manual problem
+description or repro file is needed. The repro reconstructs the failing
+receiver in the shadow VM rather than replaying the entire original eval.
+
+Poll `./lk incidents` until the latest incident reaches `repaired`. Its status
+normally moves through `awaiting-model` and `verifying`; its `detail` then
+contains the shadow verdict. Both the image queue and heartbeat continue
+while the model and shadow VM work:
+
+```bash
+./lk status
+./lk incidents
+# Latest status: repaired; detail.ok: true; detail.repro: true
+./lk eval "| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense"
+# -> 'product'
+./lk tests
+# "ok": true
+```
+
+This path has been validated with a real model. The patch remains
+tentative; use `./lk promote` if you want it to survive restart.
+
+The model may instead return `expected` or `insufficient-evidence`. Other
+terminal statuses include `shadow-verify-failed`, `out-of-scope`, `stale`,
+`bad-supervisor-response`, `supervisor-timeout`, `shadow-timeout`, and
+`repair-error`. Inspect the incident's `detail` and its matching request and
+response in `data/heal/`. An unchanged failing method is investigated once;
+a new method version can produce a new incident. Restart cancels outstanding
+work, and code changes during an investigation invalidate its proposal.
+
+Automatic repair currently covers `VendingMachine` instance methods. The
+class declares its expected failures and repair contract. Insufficient
+credit, compiler errors, boot replay, test runs, and shadow evaluation do not
+start investigations. Receivers and arguments must contain small literal
+values; complex object graphs are skipped. The original failed operation is
+never automatically retried.
+
+Disable automatic repair before continuing the remaining detours:
+
+```bash
+./lk autorepair off
+```
+
+## 5. Verify a candidate and try rollback
+
+To check a patch without changing the live image:
+
+```bash
+cat > /tmp/fix.st <<'ST'
 VendingMachine compile: 'dispense
-	paid >= price ifFalse: [ self error: ''insufficient credit'' ].
-	paid := paid - price.
-	^ ''product'''
-EOF
-cat > /tmp/r.st <<'EOF'
-| vm | vm := VendingMachine make. vm insertCoin: 60. vm dispense = 'product'
-EOF
-./lk candidate /tmp/fix.st --repro /tmp/r.st   # "ok": true; live image untouched
-./lk rollback 0 && docker compose restart prod # rewind: Greeting gone again
-sleep 12
-./lk eval "Greeting new greet: 'gone'"   # ERROR: ...Undeclared variable->Greeting
-./lk reset --yes                 # wipe /data entirely, reboot pristine
+  paid >= price ifFalse: [ self error: ''insufficient credit'' ].
+  paid := paid - price.
+  ^ ''product'''
+ST
+./lk candidate /tmp/fix.st --repro /tmp/repro.st
+# "ok": true; live image untouched
+```
+
+Run the following only after completing the persistence checks. Rolling back
+to zero removes the demo edits from the running image on its next boot;
+reset also erases the journal and heal history.
+
+```bash
+./lk rollback 0
+docker compose restart prod
+./lk status
+./lk eval "Greeting new greet: 'gone'"
+# ERROR: ... Undeclared variable ... Greeting
+./lk reset --yes
+./lk status
+# fresh image, journalSize: 0, marker: 0
 ```
 
 ## 6. Stop and clean up
 
 ```bash
-docker compose down              # stop both containers
-pkill -f fakellm.py                            # stop the fake LLM (job-control
-                                                #  %1 only works in the shell that
-                                                #  started it — pkill is the safe net)
-rm -rf data                      # clear journal/heal state (or keep it)
+docker compose down
 ```
 
-`data/` is the only mutable state; containers are disposable. `docker
-compose up -d` later resumes from `data/` exactly as it was.
-
-## Using a real LLM instead of the canned one
+Keep `data/` to retain the journal, promotion marker, and audit trail. A
+later `docker compose up -d` rebuilds from the promoted prefix. To erase the
+state after stopping the containers:
 
 ```bash
-export LIVE_LLM_URL=https://api.openai.com/v1/chat/completions   # or your proxy
+rm -rf data
+```
+
+If you used the offline endpoint below, stop that process too:
+
+```bash
+kill "$FAKE_LLM_PID"
+```
+
+## Offline path: use the fake LLM
+
+The fake endpoint returns predefined Smalltalk patches. It exercises the
+same request, verification, and swap path without model inference or an API
+key. Use this setup instead of the real endpoint configuration in section 0:
+
+```bash
+export LIVE_LLM_URL=http://host.docker.internal:8899/v1/chat/completions
 export LIVE_LLM_MODEL=gpt-4o-mini
-export LIVE_LLM_API_KEY=***
+export LIVE_LLM_API_KEY=
+python3 test/fakellm.py > /tmp/live-smalltalk-fakellm.log 2>&1 &
+FAKE_LLM_PID=$!
+```
+
+Keep this shell open so you can use `FAKE_LLM_PID` for cleanup. The server
+listens on port 8899 and normally produces no logs. You can check it with:
+
+```bash
+curl -s http://localhost:8899 -o /dev/null -w '%{http_code}\n'
+# 501: the server is listening but only handles POST requests
+```
+
+Continue with [the base-image build and boot in section 0](#0-configure-the-llm-and-boot),
+including the connection check, then follow sections 1–6. If the containers
+are already running, apply these endpoint variables with:
+
+```bash
 docker compose up -d --force-recreate supervisor
 ```
 
-Back to canned mode: `unset LIVE_LLM_URL LIVE_LLM_MODEL LIVE_LLM_API_KEY`
-then `docker compose up -d --force-recreate supervisor`.
+The repair request in section 3 contains `dispense`, which selects the
+predefined correct method. For a deterministic rejection demo, run this
+**after breaking the method in section 2 and before repairing it in section 3**:
 
-The contract the model must satisfy: reply with a fenced ```smalltalk block
-whose contents are Smalltalk statements that compile into place (method
-`compile:` sources, class definitions...). Anything it hallucinates dies in
-the shadow VM, so be as adversarial with your endpoint as you like — try
-`fakellm.py`'s sabotage mode if you want to see the trust model hold.
+```bash
+./lk heal --problem "anything BOGUS-marker" --target VendingMachine
+# "ok": false, "stage": "shadow-verify-failed"
+./lk tests
+# still failing: the rejected proposal did not repair the live method
+```
 
+`BOGUS` selects a patch that returns `'SABOTAGED'`; the suite rejects it in
+the shadow VM. This trigger belongs to the fake server and has no special
+meaning for a real model.
+
+To return to the real endpoint in `.env`, clear the offline overrides and
+recreate the supervisor:
+
+```bash
+unset LIVE_LLM_URL LIVE_LLM_MODEL LIVE_LLM_API_KEY
+docker compose up -d --force-recreate supervisor
+```
+
+Then rerun the connection check in section 0.

@@ -92,7 +92,11 @@ cls("LiveKernel", methods=[
  m("eval:", r"""| source before result clean |
 	source := sourceString asString.
 	before := Smalltalk globals keys asSet.
-	result := self evalQuiet: source.
+	result := self evalQuiet: source onError: [ :error |
+        (self isDefinition: source) ifFalse: [
+            LLMRepairService current ifNotNil: [ :service |
+                [ service capture: error source: source ] on: Error do: [ :captureError |
+                    Transcript show: 'LK-INCIDENT-ERROR: ', captureError asString; cr; flush ] ] ] ].
 	((source beginsWith: '// nojournal') not
 		and: [ self isDefinition: source ]) ifTrue: [
 		clean := ((result beginsWith: 'ERROR:')
@@ -104,14 +108,13 @@ cls("LiveKernel", methods=[
 				(sym asString endsWith: 'Tests')
 					ifTrue: [ self addTestClassNamed: sym asString ] ] ] ].
 	^ result""", True),
- m("evalQuiet:", r"""| result wrapped |
-	wrapped := '[' , sourceString asString , '] value'.
-	result := [ Smalltalk compiler evaluate: wrapped ]
-		on: Error do: [ :e | ^ 'ERROR: ', e asString ].
-	^ result isNil
-		ifTrue: [ 'nil' ]
-		ifFalse: [ [ result printString ]
-			on: Error do: [ :e | 'a ', result class name asString ] ]""", True),
+ m("evalQuiet:", r"""^ self evalQuiet: sourceString onError: [ :error | ]""", True),
+ m("evalQuiet:onError:", r"""| result wrapped |
+    wrapped := '[' , sourceString asString , '] value'.
+    result := [ Smalltalk compiler evaluate: wrapped ]
+        on: Error do: [ :error | handler value: error. ^ 'ERROR: ', error asString ].
+    ^ result isNil ifTrue: [ 'nil' ] ifFalse: [
+        [ result printString ] on: Error do: [ :error | 'a ', result class name asString ] ]""", True, params=['sourceString', 'handler']),
  m("truncate:to:", r"""| s |
 	s := aString asString.
 	^ s size <= n ifTrue: [ s ] ifFalse: [ s copyFrom: 1 to: n ]""", True),
@@ -206,6 +209,7 @@ cls("LiveKernel", methods=[
 		at: 'marker' put: self marker;
 		at: 'testClasses' put: self testClassNames;
 		at: 'healedCount' put: self healed size;
+        at: 'automaticRepair' put: (self configAt: 'automaticRepair' default: false);
 		at: 'agentMode' put: (self configAt: 'agentMode' default: 'live');
 		at: 'llmModel' put: (self configAt: 'llmModel' default: '');
 		at: 'heartbeatAgeSec' put: age;
@@ -243,6 +247,7 @@ cls("QueueServer", methods=[
  m("queueDir", r"""^ LiveKernel dataDir, '/queue'""", True),
  m("ensureQueue", r"""LiveKernel ensureDir: self queueDir""", True),
  m("loop", r"""| running |
+    LLMRepairService start.
 	self ensureQueue.
 	Transcript show: ('LK-READY: queue at ', self queueDir); cr; flush.
 	running := true.
@@ -263,6 +268,8 @@ cls("QueueServer", methods=[
 					writeStreamDo: [ :s | s nextPutAll: reply asString ].
 				[ (dir / name) ensureDelete ] on: Error do: [ :x | ].
 				(reply = 'SHUTDOWN') ifTrue: [ running := false ] ].
+        [ LLMRepairService current poll ] on: Error do: [ :error |
+            Transcript show: 'LK-REPAIR-ERROR: ', error asString; cr; flush ].
 		[ (dir / 'heartbeat.txt')
 			writeStreamDo: [ :s | s nextPutAll: Time millisecondClockValue printString ] ]
 			on: Error do: [ :x | ].
@@ -290,10 +297,13 @@ cls("QueueServer", methods=[
 			LiveKernel configAt: 'llmUrl' put: u ].
 		(job at: 'llmModel' ifAbsent: [ nil ]) ifNotNil: [ :md |
 			LiveKernel configAt: 'llmModel' put: md ].
+        (job at: 'automaticRepair' ifAbsent: [ nil ]) ifNotNil: [ :enabled |
+            LiveKernel configAt: 'automaticRepair' put: enabled ].
 		(job at: 'agentMode' ifAbsent: [ nil ]) ifNotNil: [ :md |
 			LiveKernel configAt: 'agentMode' put: md asString ].
 		^ STONJSON toString: LiveKernel status ].
 	kind = 'heal' ifTrue: [ ^ STONJSON toString: (AgentBridge handleHeal: job) ].
+	kind = 'incidents' ifTrue: [ ^ STONJSON toString: LLMRepairService current incidents ].
 	kind = 'healed' ifTrue: [ ^ STONJSON toString: LiveKernel healed ].
 	kind = 'shutdown' ifTrue: [ ^ 'SHUTDOWN' ].
 	^ LiveKernel truncate: 'ERROR: unknown job type: ', kind asString to: 800""", True),
@@ -374,6 +384,15 @@ cls("AgentBridge", methods=[
 ]),
 
 cls("Supervisor", methods=[
+ m("startCandidate:repro:", r"""| candFile reproFile outFile driver |
+    candFile := self writeTemp: 'auto-cand' contents: candidateSource extension: 'st'.
+    reproFile := self writeTemp: 'auto-repro' contents: reproSource extension: 'st'.
+    outFile := self writeTemp: 'auto-out' contents: 'PENDING' extension: 'txt'.
+    driver := self writeTemp: 'auto-driver'
+        contents: (self driverForCandidate: candFile repro: reproFile out: outFile) extension: 'st'.
+    LibC system: 'DRIVER=', driver fullName printString,
+        ' sh /opt/pharo/scripts/shadow_run.sh >/dev/null 2>&1 &'.
+    ^ outFile fullName""", True, params=['candidateSource', 'reproSource']),
  m("workspaceDir", r"""^ LiveKernel dataDir, '/workspace'""", True),
  m("writeTemp:contents:extension:", r"""| ref |
 	LiveKernel ensureDir: self workspaceDir.
@@ -435,6 +454,8 @@ cls("VendingMachine", ivars="price paid", package="LiveKernelDemo", methods=[
 	paid := paid - price.
 	^ 'product'"""),
  m("make", r"""^ self new init""", True),
+ m("repairContract", r"""^ 'A vending machine starts with price 50 and paid 0. insertCoin: adds credit. dispense must raise insufficient credit when paid < price; otherwise it subtracts price from paid and returns product. Repair behavior without changing the public protocol or instance variable layout.'""", True),
+ m("repairExpectedErrors", r"""^ #('insufficient credit')""", True),
 ]),
 
 cls("VendingMachineTests", package="LiveKernelDemo", methods=[
@@ -450,6 +471,9 @@ cls("VendingMachineTests", package="LiveKernelDemo", methods=[
 	self verify: raised description: 'should raise on empty credit'"""),
 ]),
 ]
+
+from repair_methods import repair_classes
+CLASSES.extend(repair_classes(cls, m))
 
 INSTALL_TEMPLATE = """[ | defs cls |
   defs := (STONJSON fromString: '/opt/pharo/kernel/methods.json' asFileReference contents) at: 'classes'.
